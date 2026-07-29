@@ -863,7 +863,7 @@ async def analyze_pdf(
 @app.get("/arxiv/search")
 async def arxiv_search(
     q: str = Query(..., min_length=1, max_length=160),
-    max_results: int = Query(20, ge=1, le=25),
+    max_results: int = Query(10, ge=1, le=25),
     start: int = Query(0, ge=0),
     search_field: str = Query("all", max_length=20),
     category: str = Query("", max_length=40),

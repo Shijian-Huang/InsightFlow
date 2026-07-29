@@ -77,7 +77,7 @@ let arxivSearchState = {
   query: "",
   searchField: "all",
   category: "",
-  maxResults: 20,
+  maxResults: 10,
   sortBy: "relevance",
   sortOrder: "descending",
   start: 0,
@@ -478,7 +478,7 @@ function switchSourceTab(source) {
 async function searchArxiv(event) {
   if (event) event.preventDefault();
   const query = arxivQueryInput.value.trim();
-  const maxResults = Number(arxivMaxResultsInput.value || 20);
+  const maxResults = Number(arxivMaxResultsInput.value || 10);
   const searchField = arxivSearchFieldInput.value || "all";
   const category = arxivCategoryInput.value || "";
   const {sortBy, sortOrder} = parseArxivSortMode(arxivSortModeInput.value);

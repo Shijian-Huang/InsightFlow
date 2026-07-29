@@ -16,6 +16,7 @@ OPENSEARCH_NS = {"opensearch": "http://a9.com/-/spec/opensearch/1.1/"}
 DOWNLOAD_TIMEOUT_SECONDS = 30
 SEARCH_RETRY_DELAY_SECONDS = 0.75
 SEARCH_RETRY_HTTP_CODES = {400, 408, 429, 500, 502, 503, 504}
+SEARCH_CACHE_TTL_SECONDS = 10 * 60
 SEARCH_FIELD_PREFIXES = {
     "all": "all",
     "title": "ti",
@@ -25,6 +26,7 @@ SEARCH_FIELD_PREFIXES = {
 SORT_FIELDS = {"relevance", "lastUpdatedDate", "submittedDate"}
 SORT_ORDERS = {"ascending", "descending"}
 CATEGORY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+SEARCH_CACHE: dict[tuple[str, int, int, str, str, str, str], tuple[float, dict]] = {}
 
 
 class ArxivServiceError(Exception):
@@ -158,7 +160,7 @@ def _build_search_query(query: str, search_field: str, category: str) -> str:
 
 def search_arxiv_page(
     query: str,
-    max_results: int = 20,
+    max_results: int = 10,
     start: int = 0,
     search_field: str = "all",
     category: str = "",
@@ -169,12 +171,25 @@ def search_arxiv_page(
     if not cleaned_query:
         raise ArxivServiceError("Enter a search query.")
 
-    bounded_max_results = _bounded_int(max_results, default=20, minimum=1, maximum=25)
+    bounded_max_results = _bounded_int(max_results, default=10, minimum=1, maximum=25)
     bounded_start = _bounded_int(start, default=0, minimum=0)
     normalized_search_field = _normalize_search_field(search_field)
     normalized_category = _normalize_category(category)
     normalized_sort_by = _normalize_sort_by(sort_by)
     normalized_sort_order = _normalize_sort_order(sort_order)
+    cache_key = (
+        cleaned_query.lower(),
+        bounded_max_results,
+        bounded_start,
+        normalized_search_field,
+        normalized_category,
+        normalized_sort_by,
+        normalized_sort_order,
+    )
+    cached_at, cached_payload = SEARCH_CACHE.get(cache_key, (0.0, {}))
+    if cached_payload and time.monotonic() - cached_at < SEARCH_CACHE_TTL_SECONDS:
+        return dict(cached_payload)
+
     params = urlencode({
         "search_query": _build_search_query(cleaned_query, normalized_search_field, normalized_category),
         "start": bounded_start,
@@ -226,7 +241,7 @@ def search_arxiv_page(
     page_size = items_per_page or bounded_max_results
     page = start_index // page_size + 1 if page_size else 1
     total_pages = (total_results + page_size - 1) // page_size if page_size and total_results else 0
-    return {
+    result = {
         "results": results,
         "query": cleaned_query,
         "search_field": normalized_search_field,
@@ -239,11 +254,13 @@ def search_arxiv_page(
         "page": page,
         "total_pages": total_pages,
     }
+    SEARCH_CACHE[cache_key] = (time.monotonic(), result)
+    return dict(result)
 
 
 def search_arxiv(
     query: str,
-    max_results: int = 20,
+    max_results: int = 10,
     start: int = 0,
     search_field: str = "all",
     category: str = "",
