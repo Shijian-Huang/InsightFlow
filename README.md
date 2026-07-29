@@ -29,6 +29,18 @@ Open `supabase/schema.sql`, copy its SQL content, paste it into the Supabase SQL
 
 When Supabase is configured, anonymous visitors can still analyze papers, but those results are saved only in the current browser's local storage. Signed-in users store analysis records in Supabase with that user's verified `user_id`, so the same account can see its history across devices. Without Supabase variables, DeepDoc keeps the existing local JSON storage mode.
 
+Optional Cloudflare R2 file storage for signed-in users:
+
+```bash
+R2_BUCKET=deepdoc-files
+R2_ENDPOINT_URL=https://your_account_id.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=your_r2_access_key_id
+R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
+R2_REGION=auto
+```
+
+When R2 is configured, newly uploaded PDFs for signed-in users are copied to R2 and saved on the analysis record as an object key. The `/analyses/{analysis_id}/pdf` endpoint still verifies the current Supabase user before proxying the PDF back to the browser.
+
 For MP4 generation, install `ffmpeg`. DeepDoc uses Piper TTS by default; install or configure a Piper voice model, or set another TTS provider through environment variables in `ai-service/video_generator.py`.
 
 ## Run Locally
@@ -65,6 +77,7 @@ Before deploying, verify:
 
 - `GEMINI_API_KEY` is configured in the server environment.
 - If login/history isolation is enabled, all Supabase environment variables above are configured.
+- If persistent PDF history is enabled, all R2 environment variables above are configured and `/health` reports `r2_storage_enabled: true`.
 - `/health` reports `gemini_configured: true`.
 - If MP4 generation is enabled, `/health` also reports `mp4_ready: true`.
 - The server has write access to `ai-service/uploads/` and `ai-service/data/`.

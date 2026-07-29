@@ -24,6 +24,11 @@ SUPABASE_SECRET_KEY = (
     or ""
 )
 SUPABASE_ANALYSES_TABLE = os.getenv("SUPABASE_ANALYSES_TABLE", "analyses")
+R2_BUCKET = os.getenv("R2_BUCKET", "")
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").rstrip("/")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_REGION = os.getenv("R2_REGION", "auto")
 
 
 def _ensure_data_dir() -> None:
@@ -36,6 +41,76 @@ def is_supabase_storage_enabled() -> bool:
 
 def storage_backend_name() -> str:
     return "supabase" if is_supabase_storage_enabled() else "local_json"
+
+
+def is_r2_storage_enabled() -> bool:
+    return bool(R2_BUCKET and R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY)
+
+
+def _r2_client():
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name=R2_REGION,
+    )
+
+
+def _r2_analysis_prefix(user_id: str, analysis_id: str) -> str:
+    return f"users/{user_id}/analyses/{analysis_id}"
+
+
+def _r2_pdf_key(user_id: str, analysis_id: str) -> str:
+    return f"{_r2_analysis_prefix(user_id, analysis_id)}/original.pdf"
+
+
+def upload_source_pdf_to_r2(path: str | Path, user_id: str, analysis_id: str) -> str:
+    if not is_r2_storage_enabled():
+        return ""
+
+    pdf_path = Path(path)
+    if not pdf_path.exists() or not pdf_path.is_file():
+        return ""
+
+    object_key = _r2_pdf_key(user_id, analysis_id)
+    _r2_client().upload_file(
+        str(pdf_path),
+        R2_BUCKET,
+        object_key,
+        ExtraArgs={"ContentType": "application/pdf"},
+    )
+    return object_key
+
+
+def get_r2_object(object_key: str) -> dict[str, Any] | None:
+    if not is_r2_storage_enabled() or not object_key:
+        return None
+    try:
+        return _r2_client().get_object(Bucket=R2_BUCKET, Key=object_key)
+    except Exception:
+        return None
+
+
+def head_r2_object(object_key: str) -> dict[str, Any] | None:
+    if not is_r2_storage_enabled() or not object_key:
+        return None
+    try:
+        return _r2_client().head_object(Bucket=R2_BUCKET, Key=object_key)
+    except Exception:
+        return None
+
+
+def delete_r2_object(object_key: str) -> bool:
+    if not is_r2_storage_enabled() or not object_key:
+        return False
+    try:
+        _r2_client().delete_object(Bucket=R2_BUCKET, Key=object_key)
+    except Exception:
+        return False
+    return True
 
 
 def _supabase_headers(prefer: str | None = None) -> dict[str, str]:
@@ -130,6 +205,10 @@ def save_analysis(
         record["user_id"] = user_id
     if source_pdf_path:
         record["source_pdf_path"] = str(source_pdf_path)
+        if user_id:
+            object_key = upload_source_pdf_to_r2(source_pdf_path, user_id, analysis_id)
+            if object_key:
+                record["source_pdf_object_key"] = object_key
 
     if is_supabase_storage_enabled():
         if not user_id:
@@ -292,6 +371,10 @@ def _safe_rmtree(path: Path, allowed_parent: Path) -> Optional[str]:
 
 def _delete_associated_files(record: dict) -> list[str]:
     deleted_paths: list[str] = []
+    source_pdf_object_key = str(record.get("source_pdf_object_key") or "").strip()
+    if source_pdf_object_key and delete_r2_object(source_pdf_object_key):
+        deleted_paths.append(f"r2://{R2_BUCKET}/{source_pdf_object_key}")
+
     source_pdf = _safe_unlink(record.get("source_pdf_path"), [UPLOAD_DIR])
     if source_pdf:
         deleted_paths.append(source_pdf)

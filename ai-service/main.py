@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -32,6 +32,9 @@ from services.arxiv_service import (
 from storage import (
     delete_analysis,
     get_analysis,
+    get_r2_object,
+    head_r2_object,
+    is_r2_storage_enabled,
     list_analyses,
     save_analysis,
     save_analysis_record,
@@ -53,7 +56,7 @@ from video_generator import (
     generate_video_from_script,
 )
 
-APP_VERSION = "supabase-auth-storage-20260715"
+APP_VERSION = "r2-pdf-storage-20260728"
 
 app = FastAPI(
     title="DeepDoc",
@@ -809,6 +812,7 @@ async def health_check():
         "mp4_ready": mp4_ready,
         "storage_backend": storage_backend_name(),
         "supabase_auth_enabled": is_supabase_auth_enabled(),
+        "r2_storage_enabled": is_r2_storage_enabled(),
         "upload_dir": str(UPLOAD_DIR),
         "static_dir": str(STATIC_DIR),
     }
@@ -1173,6 +1177,33 @@ async def get_analysis_pdf(
     record = get_analysis(analysis_id, user_id=user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Analysis not found")
+
+    r2_object_key = str(record.get("source_pdf_object_key") or "").strip()
+    if r2_object_key:
+        if request.method == "HEAD":
+            metadata = head_r2_object(r2_object_key)
+            if not metadata:
+                raise HTTPException(status_code=404, detail="Original PDF not found")
+            headers = {}
+            if metadata.get("ContentLength") is not None:
+                headers["Content-Length"] = str(metadata.get("ContentLength"))
+            return Response(headers=headers, media_type="application/pdf")
+
+        r2_object = get_r2_object(r2_object_key)
+        if not r2_object:
+            raise HTTPException(status_code=404, detail="Original PDF not found")
+        body = r2_object.get("Body")
+        if not body:
+            raise HTTPException(status_code=404, detail="Original PDF not found")
+        headers = {
+            "Content-Disposition": (
+                f'inline; filename="{_artifact_filename(record, analysis_id, "source-pdf", "pdf")}"'
+            )
+        }
+        content_length = r2_object.get("ContentLength")
+        if content_length is not None:
+            headers["Content-Length"] = str(content_length)
+        return StreamingResponse(body.iter_chunks(chunk_size=1024 * 1024), media_type="application/pdf", headers=headers)
 
     pdf_path = _record_pdf_path(record)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
