@@ -858,6 +858,12 @@ body.has-result .upload-form {
   gap: 18px;
 }
 
+.arxiv-direct-form {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+}
+
 .arxiv-filter-row {
   grid-column: 1 / -1;
   display: grid;
@@ -873,6 +879,7 @@ body.has-result .upload-form {
 }
 
 .arxiv-query label,
+.arxiv-direct-form label,
 .compact-select span {
   color: var(--muted);
   font-size: 0.75rem;
@@ -899,6 +906,7 @@ body.has-result .upload-form {
 }
 
 .arxiv-query input,
+.arxiv-direct-form input,
 .compact-select select {
   width: 100%;
   min-height: 40px;
@@ -947,6 +955,7 @@ body.has-result .upload-form {
 }
 
 .arxiv-query input:focus,
+.arxiv-direct-form input:focus,
 .compact-select select:focus {
   border-color: var(--accent);
   outline: 3px solid rgba(31, 122, 109, 0.14);

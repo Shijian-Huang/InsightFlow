@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DeepDoc</title>
-    <link rel="stylesheet" href="/static/styles.css?v=arxiv-cache-20260728" />
+    <link rel="stylesheet" href="/static/styles.css?v=direct-arxiv-analyze-20260729" />
   </head>
   <body>
     <main class="app-shell">
@@ -133,6 +133,13 @@
                     <option value="one_page">Detailed · Study for discussion</option>
                   </select>
                 </label>
+              </div>
+            </form>
+            <form id="arxivDirectForm" class="arxiv-direct-form">
+              <label for="arxivDirectInput">Analyze by arXiv ID or URL</label>
+              <div class="arxiv-input-wrap">
+                <input id="arxivDirectInput" type="text" placeholder="2303.08774 or https://arxiv.org/pdf/2303.08774" autocomplete="off" />
+                <button id="arxivDirectButton" class="arxiv-search-button" type="submit">Analyze</button>
               </div>
             </form>
             <div id="popularSearches" class="popular-searches" aria-label="Popular arXiv searches">
@@ -365,6 +372,6 @@
     </template>
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="/static/app.js?v=arxiv-cache-20260728"></script>
+    <script src="/static/app.js?v=direct-arxiv-analyze-20260729"></script>
   </body>
 </html>

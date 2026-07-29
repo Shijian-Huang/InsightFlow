@@ -39,6 +39,9 @@ const historyDateFilter = document.querySelector("#historyDateFilter");
 const sourceTabs = document.querySelectorAll("[data-source-tab]");
 const sourcePanels = document.querySelectorAll("[data-source-panel]");
 const arxivSearchForm = document.querySelector("#arxivSearchForm");
+const arxivDirectForm = document.querySelector("#arxivDirectForm");
+const arxivDirectInput = document.querySelector("#arxivDirectInput");
+const arxivDirectButton = document.querySelector("#arxivDirectButton");
 const arxivQueryInput = document.querySelector("#arxivQuery");
 const arxivSearchFieldInput = document.querySelector("#arxivSearchField");
 const arxivCategoryInput = document.querySelector("#arxivCategory");
@@ -154,6 +157,7 @@ resultPanel.addEventListener("click", handleCopyClick);
 resultPanel.addEventListener("change", handleResultPanelChange);
 sourceTabs.forEach((tab) => tab.addEventListener("click", () => switchSourceTab(tab.dataset.sourceTab)));
 arxivSearchForm.addEventListener("submit", searchArxiv);
+arxivDirectForm.addEventListener("submit", analyzeDirectArxiv);
 arxivResults.addEventListener("click", handleArxivResultClick);
 arxivPrevButton.addEventListener("click", () => changeArxivPage(-1));
 arxivNextButton.addEventListener("click", () => changeArxivPage(1));
@@ -551,11 +555,69 @@ async function fetchArxivPage() {
     arxivItems = [];
     arxivResults.innerHTML = "";
     resetArxivPagination();
-    arxivSearchStatus.textContent = error.message || "arXiv search failed.";
+    const message = error.message || "arXiv search failed.";
+    arxivSearchStatus.textContent = `${message} Paste an arXiv ID or PDF URL to analyze directly.`;
   } finally {
     arxivSearchButton.disabled = false;
     arxivSearchButton.textContent = "Search";
   }
+}
+
+function normalizeDirectArxivInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  const idPattern = /^([0-9]{4}\.[0-9]{4,5}(v[0-9]+)?|[a-z-]+(\.[A-Z]{2})?\/[0-9]{7}(v[0-9]+)?)$/;
+  if (idPattern.test(raw)) {
+    return {
+      arxivId: raw,
+      pdfUrl: `https://arxiv.org/pdf/${raw}`,
+    };
+  }
+
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (!["arxiv.org", "www.arxiv.org", "export.arxiv.org"].includes(host) || parts.length < 2) {
+      return null;
+    }
+    if (parts[0] !== "pdf" && parts[0] !== "abs") {
+      return null;
+    }
+    const arxivId = parts.slice(1).join("/").replace(/\.pdf$/i, "");
+    if (!idPattern.test(arxivId)) {
+      return null;
+    }
+    return {
+      arxivId,
+      pdfUrl: `https://arxiv.org/pdf/${arxivId}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function analyzeDirectArxiv(event) {
+  event.preventDefault();
+  const directPaper = normalizeDirectArxivInput(arxivDirectInput.value);
+  if (!directPaper) {
+    arxivSearchStatus.textContent = "Enter a valid arXiv ID, abs URL, or PDF URL.";
+    return;
+  }
+
+  const summaryMode = arxivSummaryModeInput.value || "standard";
+  const item = {
+    arxiv_id: directPaper.arxivId,
+    pdf_url: directPaper.pdfUrl,
+    title: "",
+    authors: [],
+    published: "",
+    updated: "",
+    categories: [],
+  };
+
+  await analyzeArxivItem(item, summaryMode, arxivDirectButton);
 }
 
 async function changeArxivPage(direction) {
@@ -673,10 +735,15 @@ async function handleArxivResultClick(event) {
   const item = arxivItems[Number(button.dataset.arxivIndex)];
   if (!item) return;
 
-  const summaryMode = arxivSummaryModeInput.value || "standard";
+  await analyzeArxivItem(item, arxivSummaryModeInput.value || "standard", button);
+}
+
+async function analyzeArxivItem(item, summaryMode, button = null) {
   setBusy(true, `Downloading ${item.arxiv_id || "arXiv paper"} and analyzing...`);
-  button.disabled = true;
-  button.textContent = "Analyzing";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Analyzing";
+  }
 
   try {
     const response = await apiFetch("/arxiv/analyze", {
@@ -706,8 +773,10 @@ async function handleArxivResultClick(event) {
   } catch (error) {
     renderError(error.message || "arXiv analysis failed.");
   } finally {
-    button.disabled = false;
-    button.textContent = "Analyze";
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Analyze";
+    }
     setBusy(false);
   }
 }
