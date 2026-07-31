@@ -449,6 +449,7 @@ historyModeFilter.addEventListener("change", renderFilteredHistory);
 historyDateFilter.addEventListener("change", renderFilteredHistory);
 startArxivPlaceholderRotation();
 document.addEventListener("click", closeDownloadMenusOnOutsideClick);
+document.addEventListener("click", closeProjectMenusOnOutsideClick);
 document.addEventListener("click", closeAccountMenuOnOutsideClick);
 document.addEventListener("keydown", handleAuthModalKeydown);
 
@@ -994,6 +995,15 @@ function closeDownloadMenusOnOutsideClick(event) {
   const activeMenu = event.target.closest(".download-menu");
   document.querySelectorAll(".download-menu[open]").forEach((menu) => {
     if (menu !== activeMenu || event.target.closest(".download-menu-list a")) {
+      menu.removeAttribute("open");
+    }
+  });
+}
+
+function closeProjectMenusOnOutsideClick(event) {
+  const activeProjectMenu = event.target.closest(".project-more-menu");
+  resultPanel.querySelectorAll(".project-more-menu[open]").forEach((menu) => {
+    if (menu !== activeProjectMenu) {
       menu.removeAttribute("open");
     }
   });
@@ -1947,7 +1957,7 @@ function createProjectNavigator(project, activeAnalysisId) {
           ${papers.map((paper) => `
             <button class="project-paper-item ${paper.analysis_id === activeAnalysisId ? "active" : ""}" type="button" data-project-paper="${escapeHtml(paper.analysis_id || "")}" title="${escapeAttribute(paperTitleFromProjectPaper(paper))}">
               <span>${escapeHtml(paperTitleFromProjectPaper(paper))}</span>
-              <small>${escapeHtml(formatPaperStatus(paper.status || "completed"))}</small>
+              ${paperStatusBadge(paper)}
             </button>
           `).join("")}
           ${papers.length > 1 ? '<button class="compare-tab" type="button" disabled>Compare</button>' : ""}
@@ -1971,6 +1981,12 @@ function formatPaperStatus(status) {
   if (normalized === "failed") return "Failed";
   if (normalized === "analyzing") return "Analyzing";
   return "Processing";
+}
+
+function paperStatusBadge(paper) {
+  const status = String(paper?.status || "completed").toLowerCase();
+  if (status === "completed") return "";
+  return `<small class="${status === "failed" ? "failed" : ""}">${escapeHtml(formatPaperStatus(status))}</small>`;
 }
 
 function updateProjectUrl(projectId, analysisId) {

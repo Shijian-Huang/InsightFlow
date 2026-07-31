@@ -62,7 +62,7 @@ from video_generator import (
     generate_video_from_script,
 )
 
-APP_VERSION = "reanalyze-menu-20260731"
+APP_VERSION = "workspace-polish-20260731"
 
 app = FastAPI(
     title="DeepDoc",

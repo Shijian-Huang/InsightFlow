@@ -1429,8 +1429,8 @@ body.has-result .drop-meta {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
-  font-size: 0.84rem;
-  font-weight: 720;
+  font-size: 0.95rem;
+  font-weight: 760;
   line-height: 1.28;
   text-align: center;
   -webkit-box-orient: vertical;
@@ -1452,10 +1452,10 @@ body.has-result .drop-meta {
   min-width: 0;
   width: min(260px, 100%);
   height: 30px;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 999px;
-  padding: 0 10px;
-  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0 6px;
+  background: transparent;
   color: var(--ink);
   font: inherit;
   font-size: 0.9rem;
@@ -1478,8 +1478,8 @@ body.has-result .drop-meta {
 }
 
 .project-name-button:hover {
-  border-color: rgba(0, 113, 227, 0.22);
-  background: rgba(246, 250, 255, 0.9);
+  border-color: rgba(0, 0, 0, 0.08);
+  background: rgba(0, 0, 0, 0.035);
 }
 
 .project-name-button:disabled {
@@ -1535,10 +1535,10 @@ body.has-result .drop-meta {
   display: inline-flex;
   align-items: center;
   min-height: 34px;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 999px;
-  padding: 0 11px;
-  background: rgba(0, 0, 0, 0.035);
+  border: 0;
+  border-radius: 0;
+  padding: 0 2px;
+  background: transparent;
   color: var(--muted);
   font-size: 0.78rem;
   font-weight: 720;
@@ -1642,6 +1642,11 @@ body.has-result .drop-meta {
   text-transform: capitalize;
 }
 
+.project-paper-item small.failed {
+  background: rgba(210, 45, 45, 0.09);
+  color: #b42318;
+}
+
 .project-paper-item.active {
   border-color: rgba(0, 113, 227, 0.25);
   background: rgba(0, 113, 227, 0.08);
@@ -1662,6 +1667,7 @@ body.has-result .drop-meta {
 }
 
 .project-more-menu summary {
+  cursor: pointer;
   list-style: none;
 }
 
