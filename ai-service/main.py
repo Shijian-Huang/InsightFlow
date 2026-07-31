@@ -30,13 +30,19 @@ from services.arxiv_service import (
     search_arxiv_page,
 )
 from storage import (
+    create_project,
     delete_analysis,
+    delete_project,
     get_analysis,
+    get_project,
     get_r2_object,
     head_r2_object,
     is_r2_storage_enabled,
     list_analyses,
+    list_projects,
+    rename_project,
     save_analysis,
+    save_failed_analysis,
     save_analysis_record,
     save_video_result,
     save_video_script,
@@ -56,7 +62,7 @@ from video_generator import (
     generate_video_from_script,
 )
 
-APP_VERSION = "r2-pdf-storage-20260728"
+APP_VERSION = "reanalyze-menu-20260731"
 
 app = FastAPI(
     title="DeepDoc",
@@ -87,6 +93,10 @@ class ReanalyzeRequest(BaseModel):
     summary_mode: str = "same"
 
 
+class RenameProjectRequest(BaseModel):
+    name: str
+
+
 def analyze_pdf_file(
     file_path: str | Path,
     filename: str,
@@ -94,6 +104,7 @@ def analyze_pdf_file(
     source_metadata: dict | None = None,
     user_id: str | None = None,
     persist: bool = True,
+    project_id: str | None = None,
 ) -> dict:
     _ensure_gemini_configured()
 
@@ -111,6 +122,8 @@ def analyze_pdf_file(
     result["generated_at"] = generated_at.isoformat()
     result["summary_mode"] = normalized_summary_mode
     result["processing_seconds"] = round(time.perf_counter() - started_at, 2)
+    if project_id:
+        result["project_id"] = project_id
     if source_metadata:
         result["source_metadata"] = source_metadata
         source_title = str(source_metadata.get("title") or "").strip()
@@ -121,7 +134,7 @@ def analyze_pdf_file(
                 summary["title"] = source_title
     if not persist:
         return result
-    record = save_analysis(filename, result, source_pdf_path=Path(file_path), user_id=user_id)
+    record = save_analysis(filename, result, source_pdf_path=Path(file_path), user_id=user_id, project_id=project_id)
     return record["result"]
 
 
@@ -234,6 +247,22 @@ def _safe_pdf_storage_name(filename: str) -> str:
     stem = _safe_filename_part(original.stem or "paper")
     suffix = original.suffix.lower() if original.suffix.lower() == ".pdf" else ".pdf"
     return f"{stem}-{uuid4().hex[:12]}{suffix}"
+
+
+def _project_name_from_filename(filename: str) -> str:
+    return Path(filename or "Untitled Project").stem.strip() or "Untitled Project"
+
+
+def _paper_title_from_result(result: dict, fallback: str = "") -> str:
+    summary = result.get("document_summary", {}) if isinstance(result.get("document_summary"), dict) else {}
+    source = result.get("source_metadata", {}) if isinstance(result.get("source_metadata"), dict) else {}
+    return str(
+        source.get("title")
+        or result.get("paper_title")
+        or summary.get("title")
+        or fallback
+        or "Untitled Paper"
+    ).strip()
 
 
 def _normalized_arxiv_id(value: str) -> str:
@@ -840,6 +869,11 @@ async def analyze_pdf(
 
     stored_filename = _safe_pdf_storage_name(filename)
     file_path = UPLOAD_DIR / stored_filename
+    project = None
+    project_id = None
+    if should_persist and user_id:
+        project = create_project("Untitled Project", user_id=user_id)
+        project_id = project.get("project_id")
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -851,6 +885,7 @@ async def analyze_pdf(
             summary_mode=summary_mode,
             user_id=user_id,
             persist=should_persist,
+            project_id=project_id,
         )
         if not should_persist:
             _remove_file_if_exists(file_path)
@@ -884,6 +919,151 @@ async def arxiv_search(
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
 
 
+@app.get("/projects")
+async def get_projects(request: Request, access_token: str | None = Query(None)):
+    user_id = _current_user_id(request, access_token=access_token)
+    return {"projects": list_projects(user_id=user_id)}
+
+
+@app.get("/projects/{project_id}")
+async def get_project_by_id(
+    request: Request,
+    project_id: str,
+    access_token: str | None = Query(None),
+):
+    user_id = _current_user_id(request, access_token=access_token)
+    project = get_project(project_id, user_id=user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.patch("/projects/{project_id}")
+async def update_project(
+    request: Request,
+    project_id: str,
+    payload: RenameProjectRequest,
+    access_token: str | None = Query(None),
+):
+    user_id = _current_user_id(request, access_token=access_token)
+    project = rename_project(project_id, payload.name, user_id=user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project_by_id(
+    request: Request,
+    project_id: str,
+    delete_files: bool = Query(True),
+    access_token: str | None = Query(None),
+):
+    user_id = _current_user_id(request, access_token=access_token)
+    deletion_result = delete_project(project_id, delete_files=delete_files, user_id=user_id)
+    if not deletion_result:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return deletion_result
+
+
+async def _analyze_project_files(
+    files: list[UploadFile],
+    summary_mode: str,
+    user_id: str,
+    project_id: str | None = None,
+) -> dict:
+    pdf_files = [item for item in files if Path(item.filename or "").suffix.lower() == ".pdf"]
+    if not pdf_files:
+        raise HTTPException(status_code=400, detail="Upload at least one PDF file.")
+    if len(pdf_files) > 10:
+        raise HTTPException(status_code=400, detail="Upload up to 10 PDF files.")
+
+    if project_id:
+        project = get_project(project_id, user_id=user_id)
+        if not project or project.get("legacy"):
+            raise HTTPException(status_code=404, detail="Project not found")
+    else:
+        project = create_project("Untitled Project", user_id=user_id)
+        project_id = project.get("project_id")
+
+    papers: list[dict] = []
+    failures: list[dict] = []
+    for index, upload in enumerate(pdf_files, start=1):
+        filename = Path(upload.filename or "uploaded.pdf").name
+        stored_filename = _safe_pdf_storage_name(filename)
+        file_path = UPLOAD_DIR / stored_filename
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(upload.file, buffer)
+        try:
+            result = analyze_pdf_file(
+                file_path,
+                filename,
+                summary_mode=summary_mode,
+                user_id=user_id,
+                project_id=project_id,
+            )
+            papers.append({
+                "analysis_id": result.get("analysis_id"),
+                "project_id": project_id,
+                "filename": filename,
+                "paper_title": _paper_title_from_result(result, fallback=filename),
+                "status": "completed",
+                "position": index,
+                "result": result,
+            })
+        except Exception as error:
+            _remove_file_if_exists(file_path)
+            failed_record = save_failed_analysis(
+                filename,
+                str(getattr(error, "detail", None) or error),
+                normalize_summary_mode(summary_mode),
+                user_id=user_id,
+                project_id=project_id,
+            )
+            failures.append({
+                "analysis_id": failed_record.get("analysis_id"),
+                "project_id": project_id,
+                "filename": filename,
+                "status": "failed",
+                "position": index,
+                "error": str(getattr(error, "detail", None) or error),
+            })
+
+    project = get_project(project_id, user_id=user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {
+        "project": project,
+        "completed": papers,
+        "failed": failures,
+    }
+
+
+@app.post("/projects/analyze-pdfs")
+async def analyze_project_pdfs(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    summary_mode: str = Form("standard"),
+    access_token: str | None = Query(None),
+):
+    _ensure_gemini_configured()
+    user_id = _current_user_id(request, access_token=access_token)
+    return await _analyze_project_files(files, summary_mode=summary_mode, user_id=user_id)
+
+
+@app.post("/projects/{project_id}/papers")
+async def add_project_papers(
+    request: Request,
+    project_id: str,
+    files: list[UploadFile] = File(...),
+    summary_mode: str = Form("standard"),
+    access_token: str | None = Query(None),
+):
+    _ensure_gemini_configured()
+    user_id = _current_user_id(request, access_token=access_token)
+    return await _analyze_project_files(files, summary_mode=summary_mode, user_id=user_id, project_id=project_id)
+
+
 @app.post("/arxiv/analyze")
 async def analyze_arxiv_paper(
     request: ArxivAnalyzeRequest,
@@ -900,6 +1080,11 @@ async def analyze_arxiv_paper(
     url_arxiv_id = arxiv_id_from_pdf_url(request.pdf_url)
     if not _arxiv_ids_match(url_arxiv_id or "", request.arxiv_id):
         raise HTTPException(status_code=400, detail="The arXiv ID does not match the PDF URL.")
+
+    project_id = None
+    if should_persist and user_id:
+        project = create_project("Untitled Project", user_id=user_id)
+        project_id = project.get("project_id")
 
     try:
         storage_arxiv_id = f"{request.arxiv_id}-{uuid4().hex[:12]}"
@@ -918,6 +1103,7 @@ async def analyze_arxiv_paper(
             summary_mode=request.summary_mode,
             user_id=user_id,
             persist=should_persist,
+            project_id=project_id,
             source_metadata={
                 "source": "arxiv",
                 "arxiv_id": request.arxiv_id,
@@ -977,6 +1163,7 @@ async def reanalyze_existing_pdf(
         Path(record.get("filename") or pdf_path.name).name,
         summary_mode=selected_summary_mode,
         user_id=user_id,
+        project_id=record.get("project_id"),
         source_metadata=result.get("source_metadata") if isinstance(result.get("source_metadata"), dict) else None,
     )
 

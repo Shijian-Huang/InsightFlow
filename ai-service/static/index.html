@@ -35,19 +35,33 @@
 
         <section class="tool-surface" aria-label="PDF analysis controls">
           <div class="source-tabs" role="tablist" aria-label="Paper source">
-            <button class="source-tab active" type="button" data-source-tab="upload">Upload PDF</button>
+            <button class="source-tab active" type="button" data-source-tab="upload">Files</button>
             <button class="source-tab" type="button" data-source-tab="arxiv">Search arXiv</button>
           </div>
 
           <div class="source-panel active" data-source-panel="upload">
             <form id="uploadForm" class="upload-form">
-              <label class="drop-zone" for="pdfFile">
-                <input id="pdfFile" name="file" type="file" accept="application/pdf" required />
-                <span class="drop-icon">PDF</span>
-                <span class="drop-title" id="fileLabel">Drop a research paper</span>
-                <span class="drop-choice">or choose a PDF</span>
-                <span class="drop-meta">Supports text-based academic PDFs.</span>
-              </label>
+              <div id="uploadDropZone" class="drop-zone">
+                <input id="pdfFile" name="file" type="file" accept="application/pdf" multiple />
+                <div class="upload-empty-state" data-upload-empty>
+                  <span class="drop-icon">PDF</span>
+                  <span class="drop-title">Upload research papers</span>
+                  <span class="drop-meta">Drag and drop PDF files here, or</span>
+                  <button id="folderButton" class="folder-button" type="button">Choose PDFs</button>
+                  <span class="drop-note">PDF only · Up to 10 files</span>
+                </div>
+                <div class="upload-selected-state" data-upload-selected hidden>
+                  <div id="fileLabel" class="upload-ready-title">0 PDFs ready</div>
+                  <div id="uploadFileList" class="upload-file-list"></div>
+                  <button id="addFilesButton" class="add-files-button" type="button">Add more files</button>
+                  <div class="upload-actions">
+                    <button id="clearUploadButton" class="clear-upload-button" type="button">Clear all</button>
+                    <button id="analyzeButton" class="analyze-button" type="submit" aria-live="polite">
+                      Analyze Paper
+                    </button>
+                  </div>
+                </div>
+              </div>
 
               <fieldset class="mode-group">
                 <legend>Summary</legend>
@@ -65,9 +79,6 @@
                 </label>
               </fieldset>
 
-              <button id="analyzeButton" class="analyze-button" type="submit" aria-live="polite">
-                Analyze Paper
-              </button>
             </form>
           </div>
 
@@ -231,41 +242,17 @@
           <h2 data-field="title">Analysis Result</h2>
           <p class="result-meta" data-field="meta"></p>
         </div>
-        <div class="result-actions">
-          <details class="download-menu">
-            <summary class="download-button">Download</summary>
-            <div class="download-menu-list">
-              <p>Analysis</p>
-              <a data-field="downloadMarkdown" href="#" download>Markdown</a>
-              <a data-field="download" href="#" download>JSON</a>
-              <p>Slides</p>
-              <a data-field="downloadSlidesHtml" href="#" download hidden>HTML</a>
-              <a data-field="downloadSlides" href="#" download hidden>Markdown</a>
-              <a data-field="downloadScript" href="#" download hidden>JSON</a>
-              <a data-field="downloadVideo" href="#" download hidden>Narrated MP4</a>
-              <p>Document</p>
-              <a data-field="downloadPdf" href="#" download hidden>Original PDF</a>
-            </div>
-          </details>
-          <label class="reanalyze-mode-control">
-            <span>Mode</span>
-            <select data-field="reanalyzeMode" aria-label="Reanalysis summary mode">
-              <option value="paragraph">Quick · Should I read this?</option>
-              <option value="standard">Standard · Understand this paper</option>
-              <option value="one_page">Detailed · Study for discussion</option>
-            </select>
-          </label>
-          <button class="ghost-button compact-action" type="button" data-field="reanalyze">Reanalyze as New</button>
-        </div>
       </div>
 
       <div class="reading-layout">
         <div class="analysis-column">
           <div class="tabs" role="tablist">
-            <button class="tab-button active" type="button" data-tab="summary">Overview</button>
-            <button class="tab-button" type="button" data-tab="evidence">Evidence</button>
-            <button class="tab-button" type="button" data-tab="references">References</button>
-            <button class="tab-button" type="button" data-tab="video">Slides</button>
+            <div class="workspace-tab-list">
+              <button class="tab-button active" type="button" data-tab="summary">Overview</button>
+              <button class="tab-button" type="button" data-tab="evidence">Evidence</button>
+              <button class="tab-button" type="button" data-tab="references">References</button>
+              <button class="tab-button" type="button" data-tab="video">Slides</button>
+            </div>
           </div>
 
           <section class="tab-panel active" data-panel="summary">
@@ -372,6 +359,6 @@
     </template>
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="/static/app.js?v=direct-arxiv-analyze-20260729"></script>
+    <script src="/static/app.js?v=reanalyze-menu-20260731"></script>
   </body>
 </html>

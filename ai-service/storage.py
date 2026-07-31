@@ -24,6 +24,7 @@ SUPABASE_SECRET_KEY = (
     or ""
 )
 SUPABASE_ANALYSES_TABLE = os.getenv("SUPABASE_ANALYSES_TABLE", "analyses")
+SUPABASE_PROJECTS_TABLE = os.getenv("SUPABASE_PROJECTS_TABLE", "projects")
 R2_BUCKET = os.getenv("R2_BUCKET", "")
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").rstrip("/")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
@@ -59,15 +60,17 @@ def _r2_client():
     )
 
 
-def _r2_analysis_prefix(user_id: str, analysis_id: str) -> str:
+def _r2_analysis_prefix(user_id: str, analysis_id: str, project_id: str | None = None) -> str:
+    if project_id:
+        return f"users/{user_id}/projects/{project_id}/analyses/{analysis_id}"
     return f"users/{user_id}/analyses/{analysis_id}"
 
 
-def _r2_pdf_key(user_id: str, analysis_id: str) -> str:
-    return f"{_r2_analysis_prefix(user_id, analysis_id)}/original.pdf"
+def _r2_pdf_key(user_id: str, analysis_id: str, project_id: str | None = None) -> str:
+    return f"{_r2_analysis_prefix(user_id, analysis_id, project_id=project_id)}/original.pdf"
 
 
-def upload_source_pdf_to_r2(path: str | Path, user_id: str, analysis_id: str) -> str:
+def upload_source_pdf_to_r2(path: str | Path, user_id: str, analysis_id: str, project_id: str | None = None) -> str:
     if not is_r2_storage_enabled():
         return ""
 
@@ -75,7 +78,7 @@ def upload_source_pdf_to_r2(path: str | Path, user_id: str, analysis_id: str) ->
     if not pdf_path.exists() or not pdf_path.is_file():
         return ""
 
-    object_key = _r2_pdf_key(user_id, analysis_id)
+    object_key = _r2_pdf_key(user_id, analysis_id, project_id=project_id)
     _r2_client().upload_file(
         str(pdf_path),
         R2_BUCKET,
@@ -124,8 +127,8 @@ def _supabase_headers(prefer: str | None = None) -> dict[str, str]:
     return headers
 
 
-def _supabase_table_url(query: str = "") -> str:
-    base = f"{SUPABASE_URL}/rest/v1/{urllib.parse.quote(SUPABASE_ANALYSES_TABLE)}"
+def _supabase_table_url(table: str = SUPABASE_ANALYSES_TABLE, query: str = "") -> str:
+    base = f"{SUPABASE_URL}/rest/v1/{urllib.parse.quote(table)}"
     return f"{base}?{query}" if query else base
 
 
@@ -134,10 +137,11 @@ def _supabase_request(
     query: str = "",
     payload: Any | None = None,
     prefer: str | None = None,
+    table: str = SUPABASE_ANALYSES_TABLE,
 ) -> Any:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        _supabase_table_url(query),
+        _supabase_table_url(table=table, query=query),
         data=data,
         headers=_supabase_headers(prefer=prefer),
         method=method,
@@ -171,12 +175,15 @@ def _supabase_row_from_record(record: dict, user_id: str) -> dict:
     return {
         "analysis_id": record.get("analysis_id"),
         "user_id": user_id,
+        "project_id": record.get("project_id"),
         "filename": record.get("filename"),
         "paper_title": metadata.get("paper_title"),
         "summary_mode": metadata.get("summary_mode"),
+        "status": record.get("status") or "completed",
         "processing_seconds": metadata.get("processing_seconds"),
         "summary": metadata.get("summary"),
         "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at") or datetime.now(timezone.utc).isoformat(),
         "record": record,
     }
 
@@ -185,11 +192,286 @@ def _record_belongs_to_user(record: dict, user_id: str | None) -> bool:
     return not user_id or record.get("user_id") == user_id
 
 
+def _project_summary_from_analysis(analysis: dict) -> dict:
+    title = analysis.get("paper_title") or analysis.get("filename") or "Untitled Paper"
+    created_at = analysis.get("created_at")
+    updated_at = analysis.get("updated_at") or created_at
+    status = analysis.get("status") or "completed"
+    return {
+        "project_id": f"legacy-{analysis.get('analysis_id')}",
+        "name": title,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "paper_count": 1,
+        "completed_count": 1 if status == "completed" else 0,
+        "failed_count": 1 if status == "failed" else 0,
+        "active_analysis_id": analysis.get("analysis_id"),
+        "legacy": True,
+        "papers": [analysis],
+    }
+
+
+def _paper_summary_from_record(record: dict) -> dict:
+    result = record.get("result", {})
+    metadata = _summary_metadata(record)
+    return {
+        "analysis_id": record.get("analysis_id"),
+        "project_id": record.get("project_id"),
+        "filename": record.get("filename"),
+        "paper_title": metadata.get("paper_title"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at") or record.get("created_at"),
+        "status": record.get("status") or "completed",
+        "summary_mode": metadata.get("summary_mode"),
+        "processing_seconds": metadata.get("processing_seconds"),
+        "summary": metadata.get("summary"),
+        "error": record.get("error") or result.get("error") if isinstance(result, dict) else record.get("error"),
+    }
+
+
+def create_project(name: str, user_id: str, project_id: str | None = None) -> dict:
+    project_id = project_id or uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    project = {
+        "project_id": project_id,
+        "user_id": user_id,
+        "name": str(name or "Untitled Project").strip() or "Untitled Project",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    if is_supabase_storage_enabled():
+        rows = _supabase_request(
+            "POST",
+            payload=project,
+            prefer="return=representation",
+            table=SUPABASE_PROJECTS_TABLE,
+        )
+        return rows[0] if isinstance(rows, list) and rows else project
+
+    return project
+
+
+def touch_project(project_id: str, user_id: str) -> None:
+    if not project_id or project_id.startswith("legacy-"):
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    if is_supabase_storage_enabled():
+        query = urllib.parse.urlencode({
+            "project_id": f"eq.{project_id}",
+            "user_id": f"eq.{user_id}",
+        })
+        _supabase_request(
+            "PATCH",
+            query=query,
+            payload={"updated_at": now},
+            table=SUPABASE_PROJECTS_TABLE,
+        )
+
+
+def rename_project(project_id: str, name: str, user_id: str) -> Optional[dict]:
+    if not project_id or project_id.startswith("legacy-"):
+        return None
+    cleaned_name = str(name or "").strip()
+    if not cleaned_name:
+        return None
+
+    if is_supabase_storage_enabled():
+        query = urllib.parse.urlencode({
+            "project_id": f"eq.{project_id}",
+            "user_id": f"eq.{user_id}",
+        })
+        rows = _supabase_request(
+            "PATCH",
+            query=query,
+            payload={
+                "name": cleaned_name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            prefer="return=representation",
+            table=SUPABASE_PROJECTS_TABLE,
+        )
+        return rows[0] if isinstance(rows, list) and rows else None
+
+    return None
+
+
+def list_projects(user_id: str | None = None) -> list[dict]:
+    analyses = list_analyses(user_id=user_id)
+
+    if is_supabase_storage_enabled():
+        if not user_id:
+            return []
+        query = urllib.parse.urlencode({
+            "user_id": f"eq.{user_id}",
+            "select": "project_id,name,created_at,updated_at",
+            "order": "updated_at.desc",
+        })
+        rows = _supabase_request("GET", query=query, table=SUPABASE_PROJECTS_TABLE)
+        projects = rows if isinstance(rows, list) else []
+    else:
+        projects = []
+
+    analyses_by_project: dict[str, list[dict]] = {}
+    legacy_projects: list[dict] = []
+    for analysis in analyses:
+        project_id = analysis.get("project_id")
+        if project_id:
+            analyses_by_project.setdefault(project_id, []).append(analysis)
+        else:
+            legacy_projects.append(_project_summary_from_analysis(analysis))
+
+    summaries: list[dict] = []
+    if not is_supabase_storage_enabled():
+        for project_id, papers in analyses_by_project.items():
+            statuses = [paper.get("status") or "completed" for paper in papers]
+            completed_count = statuses.count("completed")
+            failed_count = statuses.count("failed")
+            first_openable = next((paper for paper in papers if paper.get("status") == "completed"), papers[0] if papers else {})
+            summaries.append({
+                "project_id": project_id,
+                "name": (
+                    papers[0].get("paper_title")
+                    or papers[0].get("filename")
+                    if len(papers) == 1 and papers
+                    else "Untitled Project"
+                ),
+                "created_at": min((paper.get("created_at") or "" for paper in papers), default=""),
+                "updated_at": max((paper.get("updated_at") or paper.get("created_at") or "" for paper in papers), default=""),
+                "paper_count": len(papers),
+                "completed_count": completed_count,
+                "failed_count": failed_count,
+                "active_analysis_id": first_openable.get("analysis_id"),
+                "legacy": False,
+                "papers": papers,
+            })
+
+    for project in projects:
+        project_id = project.get("project_id")
+        papers = analyses_by_project.get(project_id, [])
+        statuses = [paper.get("status") or "completed" for paper in papers]
+        completed_count = statuses.count("completed")
+        failed_count = statuses.count("failed")
+        first_openable = next((paper for paper in papers if paper.get("status") == "completed"), papers[0] if papers else {})
+        summaries.append({
+            **project,
+            "paper_count": len(papers),
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "active_analysis_id": first_openable.get("analysis_id"),
+            "legacy": False,
+            "papers": papers,
+        })
+
+    return sorted(
+        [*summaries, *legacy_projects],
+        key=lambda project: project.get("updated_at") or project.get("created_at") or "",
+        reverse=True,
+    )
+
+
+def get_project(project_id: str, user_id: str) -> Optional[dict]:
+    if not project_id:
+        return None
+
+    if project_id.startswith("legacy-"):
+        analysis_id = project_id.replace("legacy-", "", 1)
+        record = get_analysis(analysis_id, user_id=user_id)
+        if not record:
+            return None
+        analysis = _paper_summary_from_record(record)
+        return _project_summary_from_analysis(analysis) | {
+            "papers": [{**analysis, "record": record}],
+        }
+
+    if is_supabase_storage_enabled():
+        query = urllib.parse.urlencode({
+            "project_id": f"eq.{project_id}",
+            "user_id": f"eq.{user_id}",
+            "select": "project_id,name,created_at,updated_at",
+            "limit": "1",
+        })
+        rows = _supabase_request("GET", query=query, table=SUPABASE_PROJECTS_TABLE)
+        if not isinstance(rows, list) or not rows:
+            return None
+        project = rows[0]
+        analyses_query = urllib.parse.urlencode({
+            "project_id": f"eq.{project_id}",
+            "user_id": f"eq.{user_id}",
+            "select": "analysis_id,project_id,filename,paper_title,created_at,updated_at,status,summary_mode,processing_seconds,summary,record",
+            "order": "created_at.asc",
+        })
+        analysis_rows = _supabase_request("GET", query=analyses_query)
+        papers = []
+        for row in analysis_rows if isinstance(analysis_rows, list) else []:
+            record = row.get("record") if isinstance(row.get("record"), dict) else {}
+            papers.append({
+                "analysis_id": row.get("analysis_id"),
+                "project_id": row.get("project_id"),
+                "filename": row.get("filename"),
+                "paper_title": row.get("paper_title"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at") or row.get("created_at"),
+                "status": row.get("status") or "completed",
+                "summary_mode": row.get("summary_mode"),
+                "processing_seconds": row.get("processing_seconds"),
+                "summary": row.get("summary"),
+                "record": record,
+            })
+        statuses = [paper.get("status") or "completed" for paper in papers]
+        return {
+            **project,
+            "paper_count": len(papers),
+            "completed_count": statuses.count("completed"),
+            "failed_count": statuses.count("failed"),
+            "active_analysis_id": next((paper.get("analysis_id") for paper in papers if paper.get("status") == "completed"), papers[0].get("analysis_id") if papers else None),
+            "legacy": False,
+            "papers": papers,
+        }
+
+    papers = []
+    for record_path in DATA_DIR.glob("*.json"):
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not _record_belongs_to_user(record, user_id):
+            continue
+        if record.get("project_id") != project_id:
+            continue
+        papers.append({**_paper_summary_from_record(record), "record": record})
+
+    if not papers:
+        return None
+
+    papers.sort(key=lambda paper: paper.get("created_at") or "")
+    statuses = [paper.get("status") or "completed" for paper in papers]
+    return {
+        "project_id": project_id,
+        "name": (
+            papers[0].get("paper_title")
+            or papers[0].get("filename")
+            if len(papers) == 1 and papers
+            else "Untitled Project"
+        ),
+        "created_at": min((paper.get("created_at") or "" for paper in papers), default=""),
+        "updated_at": max((paper.get("updated_at") or paper.get("created_at") or "" for paper in papers), default=""),
+        "paper_count": len(papers),
+        "completed_count": statuses.count("completed"),
+        "failed_count": statuses.count("failed"),
+        "active_analysis_id": next((paper.get("analysis_id") for paper in papers if paper.get("status") == "completed"), papers[0].get("analysis_id")),
+        "legacy": False,
+        "papers": papers,
+    }
+
+
 def save_analysis(
     filename: str,
     result: dict,
     source_pdf_path: str | Path | None = None,
     user_id: str | None = None,
+    project_id: str | None = None,
+    status: str = "completed",
 ) -> dict:
     _ensure_data_dir()
 
@@ -197,8 +479,11 @@ def save_analysis(
     result["analysis_id"] = analysis_id
     record = {
         "analysis_id": analysis_id,
+        "project_id": project_id,
         "filename": filename,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
         "result": result,
     }
     if user_id:
@@ -206,7 +491,7 @@ def save_analysis(
     if source_pdf_path:
         record["source_pdf_path"] = str(source_pdf_path)
         if user_id:
-            object_key = upload_source_pdf_to_r2(source_pdf_path, user_id, analysis_id)
+            object_key = upload_source_pdf_to_r2(source_pdf_path, user_id, analysis_id, project_id=project_id)
             if object_key:
                 record["source_pdf_object_key"] = object_key
 
@@ -218,11 +503,60 @@ def save_analysis(
             payload=_supabase_row_from_record(record, user_id),
             prefer="return=representation",
         )
+        if project_id:
+            touch_project(project_id, user_id=user_id)
         return rows[0].get("record", record) if isinstance(rows, list) and rows else record
 
     record_path = DATA_DIR / f"{analysis_id}.json"
     record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
+    return record
+
+
+def save_failed_analysis(
+    filename: str,
+    error: str,
+    summary_mode: str,
+    user_id: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    _ensure_data_dir()
+
+    analysis_id = uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    result = {
+        "analysis_id": analysis_id,
+        "project_id": project_id,
+        "summary_mode": summary_mode,
+        "error": error,
+    }
+    record = {
+        "analysis_id": analysis_id,
+        "project_id": project_id,
+        "filename": filename,
+        "created_at": now,
+        "updated_at": now,
+        "status": "failed",
+        "error": error,
+        "result": result,
+    }
+    if user_id:
+        record["user_id"] = user_id
+
+    if is_supabase_storage_enabled():
+        if not user_id:
+            raise RuntimeError("Supabase storage requires a user_id.")
+        rows = _supabase_request(
+            "POST",
+            payload=_supabase_row_from_record(record, user_id),
+            prefer="return=representation",
+        )
+        if project_id:
+            touch_project(project_id, user_id=user_id)
+        return rows[0].get("record", record) if isinstance(rows, list) and rows else record
+
+    record_path = DATA_DIR / f"{analysis_id}.json"
+    record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record
 
 
@@ -235,8 +569,8 @@ def list_analyses(user_id: str | None = None) -> list[dict]:
             return []
         query = urllib.parse.urlencode({
             "user_id": f"eq.{user_id}",
-            "select": "analysis_id,filename,paper_title,created_at,summary_mode,processing_seconds,summary",
-            "order": "created_at.desc",
+            "select": "analysis_id,project_id,filename,paper_title,created_at,updated_at,status,summary_mode,processing_seconds,summary",
+            "order": "updated_at.desc",
         })
         rows = _supabase_request("GET", query=query)
         return rows if isinstance(rows, list) else []
@@ -254,9 +588,12 @@ def list_analyses(user_id: str | None = None) -> list[dict]:
         source = result.get("source_metadata", {}) if isinstance(result.get("source_metadata"), dict) else {}
         analyses.append({
             "analysis_id": record.get("analysis_id"),
+            "project_id": record.get("project_id"),
             "filename": record.get("filename"),
             "paper_title": source.get("title") or result.get("paper_title") or summary.get("title"),
             "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at") or record.get("created_at"),
+            "status": record.get("status") or "completed",
             "summary_mode": result.get("summary_mode"),
             "processing_seconds": result.get("processing_seconds"),
             "summary": summary.get("summary", ""),
@@ -310,6 +647,8 @@ def save_analysis_record(analysis_id: str, record: dict, user_id: str | None = N
     record["analysis_id"] = analysis_id
     if user_id:
         record["user_id"] = user_id
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
+    record["status"] = record.get("status") or "completed"
     result = record.get("result")
     if isinstance(result, dict):
         result["analysis_id"] = result.get("analysis_id") or analysis_id
@@ -330,6 +669,9 @@ def save_analysis_record(analysis_id: str, record: dict, user_id: str | None = N
         if not isinstance(rows, list) or not rows:
             return None
         saved_record = rows[0].get("record")
+        project_id = str(record.get("project_id") or "")
+        if project_id:
+            touch_project(project_id, user_id=user_id)
         return saved_record if isinstance(saved_record, dict) else record
 
     record_path = DATA_DIR / f"{analysis_id}.json"
@@ -438,14 +780,18 @@ def delete_analysis(analysis_id: str, delete_files: bool = True, user_id: str | 
         record = get_analysis(analysis_id, user_id=user_id)
         if not record:
             return None
+        project_id = str(record.get("project_id") or "")
         deleted_files = _delete_associated_files(record) if delete_files else []
         query = urllib.parse.urlencode({
             "analysis_id": f"eq.{analysis_id}",
             "user_id": f"eq.{user_id}",
         })
         _supabase_request("DELETE", query=query)
+        if project_id:
+            delete_project_if_empty(project_id, user_id=user_id)
         return {
             "analysis_id": analysis_id,
+            "project_id": project_id,
             "deleted": True,
             "deleted_files": deleted_files,
         }
@@ -460,15 +806,75 @@ def delete_analysis(analysis_id: str, delete_files: bool = True, user_id: str | 
         record = {"analysis_id": analysis_id}
     if not _record_belongs_to_user(record, user_id):
         return None
+    project_id = str(record.get("project_id") or "")
 
     deleted_files = _delete_associated_files(record) if delete_files else []
 
     record_path.unlink()
     return {
         "analysis_id": analysis_id,
+        "project_id": project_id,
         "deleted": True,
         "deleted_files": deleted_files,
     }
+
+
+def delete_project_if_empty(project_id: str, user_id: str) -> bool:
+    if not project_id or project_id.startswith("legacy-"):
+        return False
+    if not is_supabase_storage_enabled():
+        return False
+
+    query = urllib.parse.urlencode({
+        "project_id": f"eq.{project_id}",
+        "user_id": f"eq.{user_id}",
+        "select": "analysis_id",
+        "limit": "1",
+    })
+    rows = _supabase_request("GET", query=query)
+    if isinstance(rows, list) and rows:
+        touch_project(project_id, user_id=user_id)
+        return False
+
+    delete_query = urllib.parse.urlencode({
+        "project_id": f"eq.{project_id}",
+        "user_id": f"eq.{user_id}",
+    })
+    _supabase_request("DELETE", query=delete_query, table=SUPABASE_PROJECTS_TABLE)
+    return True
+
+
+def delete_project(project_id: str, delete_files: bool = True, user_id: str | None = None) -> Optional[dict]:
+    if not user_id or not project_id:
+        return None
+
+    if project_id.startswith("legacy-"):
+        analysis_id = project_id.replace("legacy-", "", 1)
+        return delete_analysis(analysis_id, delete_files=delete_files, user_id=user_id)
+
+    project = get_project(project_id, user_id=user_id)
+    if not project:
+        return None
+
+    deleted_files: list[str] = []
+    for paper in project.get("papers", []):
+        record = paper.get("record") if isinstance(paper, dict) else None
+        if isinstance(record, dict) and delete_files:
+            deleted_files.extend(_delete_associated_files(record))
+
+    if is_supabase_storage_enabled():
+        query = urllib.parse.urlencode({
+            "project_id": f"eq.{project_id}",
+            "user_id": f"eq.{user_id}",
+        })
+        _supabase_request("DELETE", query=query, table=SUPABASE_PROJECTS_TABLE)
+        return {
+            "project_id": project_id,
+            "deleted": True,
+            "deleted_files": deleted_files,
+        }
+
+    return None
 
 
 def save_video_script(analysis_id: str, video_script: dict, user_id: str | None = None) -> Optional[dict]:

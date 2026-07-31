@@ -1,6 +1,13 @@
 const uploadForm = document.querySelector("#uploadForm");
+const uploadDropZone = document.querySelector("#uploadDropZone");
 const pdfFileInput = document.querySelector("#pdfFile");
 const fileLabel = document.querySelector("#fileLabel");
+const folderButton = document.querySelector("#folderButton");
+const uploadEmptyState = document.querySelector("[data-upload-empty]");
+const uploadSelectedState = document.querySelector("[data-upload-selected]");
+const uploadFileList = document.querySelector("#uploadFileList");
+const addFilesButton = document.querySelector("#addFilesButton");
+const clearUploadButton = document.querySelector("#clearUploadButton");
 const analyzeButton = document.querySelector("#analyzeButton");
 const statusPanel = document.querySelector("#statusPanel");
 const statusText = document.querySelector("#statusText");
@@ -64,10 +71,17 @@ const arxivPlaceholders = [
   "Search by title, author, or topic.",
 ];
 const ANONYMOUS_HISTORY_KEY = "deepdoc.anonymousAnalyses.v1";
+const ANONYMOUS_PROJECTS_KEY = "deepdoc.anonymousProjects.v1";
+const ANONYMOUS_PDF_DB_NAME = "deepdoc.anonymousPdfs";
+const ANONYMOUS_PDF_STORE = "pdfs";
 const ANONYMOUS_HISTORY_LIMIT = 50;
+const MAX_UPLOAD_FILES = 10;
 
 let historyItems = [];
 let arxivItems = [];
+let currentProject = null;
+let projectLocalFiles = new Map();
+let pendingAddProjectId = "";
 let authState = {
   enabled: false,
   client: null,
@@ -76,6 +90,7 @@ let authState = {
   session: null,
 };
 let activeLocalPdfUrl = "";
+let uploadFiles = [];
 let arxivSearchState = {
   query: "",
   searchField: "all",
@@ -91,43 +106,310 @@ let arxivSearchState = {
 
 initAuth();
 
+function isPdfFile(file) {
+  return Boolean(file) && (
+    file.type === "application/pdf" ||
+    file.name.toLowerCase().endsWith(".pdf")
+  );
+}
+
+function uploadDisplayName(file) {
+  return file.relativePath || file.webkitRelativePath || file.name;
+}
+
+function selectedUploadFiles() {
+  return uploadFiles.filter(isPdfFile);
+}
+
+function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function uploadFileKey(file) {
+  return [
+    uploadDisplayName(file),
+    file.size,
+    file.lastModified,
+  ].join("|");
+}
+
+function setUploadFiles(files, { append = false } = {}) {
+  const nextFiles = append ? [...uploadFiles] : [];
+  const seen = new Set(nextFiles.map(uploadFileKey));
+
+  for (const file of files.filter(isPdfFile)) {
+    const key = uploadFileKey(file);
+    if (seen.has(key)) continue;
+    nextFiles.push(file);
+    seen.add(key);
+    if (nextFiles.length >= MAX_UPLOAD_FILES) break;
+  }
+
+  uploadFiles = nextFiles;
+  pdfFileInput.value = "";
+  renderUploadState();
+}
+
+function removeUploadFile(index) {
+  uploadFiles = uploadFiles.filter((_, itemIndex) => itemIndex !== index);
+  renderUploadState();
+}
+
+function clearUploadFiles() {
+  uploadFiles = [];
+  pdfFileInput.value = "";
+  renderUploadState();
+}
+
+function renderUploadState() {
+  const files = selectedUploadFiles();
+  const hasFiles = files.length > 0;
+  uploadEmptyState.hidden = hasFiles;
+  uploadSelectedState.hidden = !hasFiles;
+  analyzeButton.disabled = document.body.classList.contains("is-busy") || !hasFiles;
+
+  if (!hasFiles) {
+    uploadFileList.innerHTML = "";
+    analyzeButton.textContent = "Analyze Paper";
+    return;
+  }
+
+  fileLabel.textContent = `${files.length} PDF${files.length === 1 ? "" : "s"} ready`;
+  analyzeButton.textContent = `Analyze ${files.length} PDF${files.length === 1 ? "" : "s"}`;
+  uploadFileList.innerHTML = files.map((file, index) => `
+    <div class="upload-file-row">
+      <span class="upload-file-name">${escapeHtml(uploadDisplayName(file))}</span>
+      <span class="upload-file-size">${escapeHtml(formatFileSize(file.size))}</span>
+      <button class="upload-remove-button" type="button" data-remove-upload="${index}" aria-label="Remove ${escapeHtml(uploadDisplayName(file))}">×</button>
+    </div>
+  `).join("");
+}
+
+renderUploadState();
+
+async function analyzeUploadFile(file, summaryMode) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("summary_mode", summaryMode);
+
+  const response = await apiFetch("/analyze-pdf", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Analysis failed with status ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function analyzeProjectUploadFiles(files, summaryMode, projectId = "") {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file, uploadDisplayName(file)));
+  formData.append("summary_mode", summaryMode);
+
+  const endpoint = projectId
+    ? `/projects/${encodeURIComponent(projectId)}/papers`
+    : "/projects/analyze-pdfs";
+  const response = await apiFetch(endpoint, {
+    method: "POST",
+    body: formData,
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(payload.detail || `Analysis failed with status ${response.status}`);
+  }
+
+  return payload;
+}
+
+function renderUploadBatchStatus(successes, failures) {
+  if (successes.length <= 1 && !failures.length) return;
+
+  const notice = document.createElement("div");
+  notice.className = failures.length ? "upload-batch-status warning" : "upload-batch-status";
+  notice.textContent = failures.length
+    ? `Analyzed ${successes.length} file${successes.length === 1 ? "" : "s"}; ${failures.length} failed. Showing the latest completed analysis.`
+    : `Analyzed ${successes.length} files. Showing the latest completed analysis.`;
+  resultPanel.prepend(notice);
+}
+
+function readFileEntry(entry, path = "") {
+  return new Promise((resolve) => {
+    entry.file((file) => {
+      file.relativePath = `${path}${file.name}`;
+      resolve(file);
+    }, () => resolve(null));
+  });
+}
+
+function readDirectoryEntry(entry, path = "") {
+  const reader = entry.createReader();
+  const entries = [];
+
+  return new Promise((resolve) => {
+    const readBatch = () => {
+      reader.readEntries(async (batch) => {
+        if (!batch.length) {
+          const files = await Promise.all(entries.map((child) => readDroppedEntry(child, `${path}${entry.name}/`)));
+          resolve(files.flat().filter(Boolean));
+          return;
+        }
+        entries.push(...batch);
+        readBatch();
+      }, () => resolve([]));
+    };
+
+    readBatch();
+  });
+}
+
+function readDroppedEntry(entry, path = "") {
+  if (!entry) return Promise.resolve([]);
+  if (entry.isFile) return readFileEntry(entry, path).then((file) => file ? [file] : []);
+  if (entry.isDirectory) return readDirectoryEntry(entry, path);
+  return Promise.resolve([]);
+}
+
+async function droppedFilesFromEvent(event) {
+  const items = Array.from(event.dataTransfer?.items || []);
+  const entries = items
+    .map((item) => item.webkitGetAsEntry?.())
+    .filter(Boolean);
+
+  if (entries.length) {
+    const files = await Promise.all(entries.map((entry) => readDroppedEntry(entry)));
+    return files.flat().filter(isPdfFile);
+  }
+
+  return Array.from(event.dataTransfer?.files || []).filter(isPdfFile);
+}
+
 pdfFileInput.addEventListener("change", () => {
-  const file = pdfFileInput.files[0];
-  fileLabel.textContent = file ? file.name : "Drop a research paper";
+  setUploadFiles(Array.from(pdfFileInput.files || []), { append: uploadFiles.length > 0 });
+});
+
+folderButton.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  pdfFileInput.click();
+});
+
+addFilesButton.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  pdfFileInput.click();
+});
+
+clearUploadButton.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  clearUploadFiles();
+});
+
+uploadFileList.addEventListener("click", (event) => {
+  const removeButton = event.target.closest("[data-remove-upload]");
+  if (!removeButton) return;
+  event.preventDefault();
+  event.stopPropagation();
+  removeUploadFile(Number(removeButton.dataset.removeUpload));
+});
+
+uploadDropZone.addEventListener("click", (event) => {
+  if (event.target.closest("button")) return;
+  pdfFileInput.click();
+});
+
+uploadDropZone.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  uploadDropZone.classList.add("is-dragging");
+});
+
+uploadDropZone.addEventListener("dragleave", (event) => {
+  if (!uploadDropZone.contains(event.relatedTarget)) {
+    uploadDropZone.classList.remove("is-dragging");
+  }
+});
+
+uploadDropZone.addEventListener("drop", async (event) => {
+  event.preventDefault();
+  uploadDropZone.classList.remove("is-dragging");
+  if (document.body.classList.contains("is-busy")) return;
+
+  const files = await droppedFilesFromEvent(event);
+  setUploadFiles(files, { append: uploadFiles.length > 0 });
 });
 
 uploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
 
-  const file = pdfFileInput.files[0];
-  if (!file) {
-    renderError("Choose a PDF before starting analysis.");
+  const files = selectedUploadFiles();
+  if (!files.length) {
+    renderError("Choose a file before starting analysis.");
     return;
   }
 
-  const formData = new FormData();
   const summaryMode = new FormData(uploadForm).get("summaryMode") || "standard";
-  formData.append("file", file);
-  formData.append("summary_mode", summaryMode);
-
-  setBusy(true, "Analyzing paper...");
+  const successes = [];
+  const failures = [];
 
   try {
-    const response = await apiFetch("/analyze-pdf", {
-      method: "POST",
-      body: formData,
+    if (!usesAnonymousHistory()) {
+      setBusy(true, files.length > 1 ? `Analyzing 1 of ${files.length} papers...` : "Analyzing paper...");
+      const payload = await analyzeProjectUploadFiles(files, summaryMode, pendingAddProjectId);
+      const project = payload.project;
+      projectLocalFiles = new Map();
+      (payload.completed || []).forEach((paper) => {
+        if (paper.analysis_id) {
+          const matchingFile = files.find((file) => uploadDisplayName(file) === paper.filename || file.name === paper.filename);
+          if (matchingFile) projectLocalFiles.set(paper.analysis_id, matchingFile);
+        }
+      });
+      pendingAddProjectId = "";
+      clearUploadFiles();
+      if (project) {
+        renderProject(project, project.active_analysis_id);
+      }
+      await loadHistory();
+      return;
+    }
+
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const displayName = uploadDisplayName(file);
+      const progress = files.length > 1 ? `${index + 1} of ${files.length}: ` : "";
+      setBusy(true, `Analyzing ${progress}${displayName}`);
+      try {
+        const result = await analyzeUploadFile(file, summaryMode);
+        result.analysis_id = result.analysis_id || `local-${window.crypto?.randomUUID?.() || `${Date.now()}-${index}`}`;
+        successes.push({ file, result, displayName });
+      } catch (error) {
+        failures.push({ file, displayName, message: error.message || "Analysis failed." });
+      }
+    }
+
+    if (!successes.length) {
+      throw new Error(failures[0]?.message || "Analysis failed.");
+    }
+
+    await Promise.allSettled(
+      successes.map((item) => saveAnonymousPdfFile(item.result.analysis_id, item.file)),
+    );
+    const latestSuccess = successes[successes.length - 1];
+    const project = pendingAddProjectId
+      ? addAnonymousProjectPapers(pendingAddProjectId, successes, failures)
+      : saveAnonymousProject(successes, failures);
+    successes.forEach((item) => {
+      projectLocalFiles.set(item.result.analysis_id, item.file);
     });
-
-    if (!response.ok) {
-      throw new Error(`Analysis failed with status ${response.status}`);
-    }
-
-    const result = await response.json();
-    setActiveLocalPdf(file);
-    if (usesAnonymousHistory()) {
-      saveAnonymousAnalysis(result, file.name);
-    }
-    renderResult(result, file.name);
+    pendingAddProjectId = "";
+    clearUploadFiles();
+    renderProject(project, latestSuccess.result.analysis_id);
+    renderUploadBatchStatus(successes, failures);
     await loadHistory();
   } catch (error) {
     renderError(error.message || "Analysis failed.");
@@ -177,9 +459,14 @@ async function initAuth() {
     const config = await response.json();
     authState.enabled = Boolean(config.enabled);
     authBox.hidden = !authState.enabled;
-    if (!authState.enabled) return;
+    if (!authState.enabled) {
+      authState.ready = true;
+      restoreProjectFromUrl();
+      return;
+    }
     if (!window.supabase?.createClient) {
       setAuthStatus("Auth library did not load.");
+      restoreProjectFromUrl();
       return;
     }
 
@@ -189,16 +476,39 @@ async function initAuth() {
     authState.session = data?.session || null;
     authState.ready = true;
     renderAuthState();
+    restoreProjectFromUrl();
     authState.client.auth.onAuthStateChange((_event, session) => {
       authState.session = session;
       renderAuthState();
       loadHistory();
+      restoreProjectFromUrl();
     });
   } catch (error) {
     authBox.hidden = false;
     authState.ready = false;
     setAuthStatus(error.message || "Auth could not initialize.");
   }
+}
+
+function restoreProjectFromUrl() {
+  const url = new URL(window.location.href);
+  const projectId = url.searchParams.get("project") || "";
+  const analysisId = url.searchParams.get("paper") || "";
+  if (!projectId) return false;
+
+  const localProject = getAnonymousProject(projectId);
+  if (localProject) {
+    renderProject(localProject, analysisId || localProject.active_analysis_id);
+    return true;
+  }
+
+  if (!authState.session?.access_token) {
+    renderError("Sign in to reopen this saved project.");
+    return true;
+  }
+
+  openProject(projectId, analysisId);
+  return true;
 }
 
 function isSignedIn() {
@@ -223,11 +533,118 @@ function readAnonymousRecords() {
   }
 }
 
+function readAnonymousProjects() {
+  try {
+    const projects = JSON.parse(window.localStorage.getItem(ANONYMOUS_PROJECTS_KEY) || "[]");
+    return Array.isArray(projects) ? projects.filter((project) => project && typeof project === "object") : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeAnonymousProjects(projects) {
+  window.localStorage.setItem(
+    ANONYMOUS_PROJECTS_KEY,
+    JSON.stringify(projects.slice(0, ANONYMOUS_HISTORY_LIMIT)),
+  );
+}
+
 function writeAnonymousRecords(records) {
   window.localStorage.setItem(
     ANONYMOUS_HISTORY_KEY,
     JSON.stringify(records.slice(0, ANONYMOUS_HISTORY_LIMIT)),
   );
+}
+
+function openAnonymousPdfDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error("Browser PDF storage is not available."));
+      return;
+    }
+
+    const request = window.indexedDB.open(ANONYMOUS_PDF_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ANONYMOUS_PDF_STORE)) {
+        db.createObjectStore(ANONYMOUS_PDF_STORE, {keyPath: "analysis_id"});
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open browser PDF storage."));
+  });
+}
+
+async function withAnonymousPdfStore(mode, callback) {
+  const db = await openAnonymousPdfDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(ANONYMOUS_PDF_STORE, mode);
+    const store = transaction.objectStore(ANONYMOUS_PDF_STORE);
+    let callbackResult;
+    transaction.oncomplete = () => {
+      db.close();
+      resolve(callbackResult);
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error || new Error("Browser PDF storage failed."));
+    };
+    try {
+      callbackResult = callback(store);
+    } catch (error) {
+      transaction.abort();
+      reject(error);
+    }
+  });
+}
+
+async function saveAnonymousPdfFile(analysisId, file) {
+  if (!analysisId || !file) return;
+  await withAnonymousPdfStore("readwrite", (store) => {
+    store.put({
+      analysis_id: analysisId,
+      file,
+      filename: uploadDisplayName(file),
+      type: file.type || "application/pdf",
+      last_modified: file.lastModified || Date.now(),
+      saved_at: new Date().toISOString(),
+    });
+  });
+}
+
+async function getAnonymousPdfFile(analysisId, fallbackFilename = "paper.pdf") {
+  if (!analysisId) return null;
+  return withAnonymousPdfStore("readonly", (store) => new Promise((resolve) => {
+    const request = store.get(analysisId);
+    request.onsuccess = () => {
+      const record = request.result;
+      if (!record?.file) {
+        resolve(null);
+        return;
+      }
+      if (record.file instanceof File) {
+        resolve(record.file);
+        return;
+      }
+      resolve(new File([record.file], record.filename || fallbackFilename, {
+        type: record.type || "application/pdf",
+        lastModified: record.last_modified || Date.now(),
+      }));
+    };
+    request.onerror = () => resolve(null);
+  }));
+}
+
+async function deleteAnonymousPdfFile(analysisId) {
+  if (!analysisId) return;
+  await withAnonymousPdfStore("readwrite", (store) => {
+    store.delete(analysisId);
+  });
+}
+
+async function deleteAnonymousProjectPdfFiles(project) {
+  const papers = Array.isArray(project?.papers) ? project.papers : [];
+  await Promise.allSettled(papers.map((paper) => deleteAnonymousPdfFile(paper.analysis_id)));
 }
 
 function anonymousRecordId() {
@@ -246,6 +663,111 @@ function saveAnonymousAnalysis(result, filename) {
   return record;
 }
 
+function saveAnonymousProject(successes, failures = []) {
+  const now = new Date().toISOString();
+  const projectId = anonymousRecordId();
+  const papers = successes.map((item) => ({
+    local: true,
+    analysis_id: item.result.analysis_id,
+    project_id: projectId,
+    filename: item.displayName,
+    paper_title: paperTitleFromResult(item.result, item.displayName),
+    created_at: now,
+    updated_at: now,
+    status: "completed",
+    record: {
+      local: true,
+      analysis_id: item.result.analysis_id,
+      project_id: projectId,
+      filename: item.displayName,
+      created_at: now,
+      updated_at: now,
+      status: "completed",
+      result: item.result,
+    },
+  }));
+  const failedPapers = failures.map((item, index) => ({
+    local: true,
+    analysis_id: `${projectId}-failed-${index}`,
+    project_id: projectId,
+    filename: item.displayName,
+    paper_title: item.displayName,
+    created_at: now,
+    updated_at: now,
+    status: "failed",
+    error: item.message,
+  }));
+  const firstPaper = papers[0] || failedPapers[0] || {};
+  const project = {
+    local: true,
+    project_id: projectId,
+    name: "Untitled Project",
+    created_at: now,
+    updated_at: now,
+    paper_count: papers.length + failedPapers.length,
+    completed_count: papers.length,
+    failed_count: failedPapers.length,
+    active_analysis_id: firstPaper.analysis_id,
+    papers: [...papers, ...failedPapers],
+  };
+  writeAnonymousProjects([project, ...readAnonymousProjects()]);
+  return project;
+}
+
+function addAnonymousProjectPapers(projectId, successes, failures = []) {
+  const projects = readAnonymousProjects();
+  const project = projects.find((item) => item.project_id === projectId);
+  if (!project) {
+    return saveAnonymousProject(successes, failures);
+  }
+
+  const now = new Date().toISOString();
+  const papers = Array.isArray(project.papers) ? project.papers : [];
+  const newPapers = successes.map((item) => ({
+    local: true,
+    analysis_id: item.result.analysis_id,
+    project_id: projectId,
+    filename: item.displayName,
+    paper_title: paperTitleFromResult(item.result, item.displayName),
+    created_at: now,
+    updated_at: now,
+    status: "completed",
+    record: {
+      local: true,
+      analysis_id: item.result.analysis_id,
+      project_id: projectId,
+      filename: item.displayName,
+      created_at: now,
+      updated_at: now,
+      status: "completed",
+      result: item.result,
+    },
+  }));
+  const failedPapers = failures.map((item, index) => ({
+    local: true,
+    analysis_id: `${projectId}-failed-${Date.now()}-${index}`,
+    project_id: projectId,
+    filename: item.displayName,
+    paper_title: item.displayName,
+    created_at: now,
+    updated_at: now,
+    status: "failed",
+    error: item.message,
+  }));
+  const updatedProject = {
+    ...project,
+    updated_at: now,
+    papers: [...papers, ...newPapers, ...failedPapers],
+  };
+  updatedProject.paper_count = updatedProject.papers.length;
+  updatedProject.completed_count = updatedProject.papers.filter((paper) => paper.status === "completed").length;
+  updatedProject.failed_count = updatedProject.papers.filter((paper) => paper.status === "failed").length;
+  writeAnonymousProjects(projects.map((item) => (
+    item.project_id === projectId ? updatedProject : item
+  )));
+  return updatedProject;
+}
+
 function anonymousHistorySummary(record) {
   const result = record.result || {};
   const summary = result.document_summary || {};
@@ -262,12 +784,32 @@ function anonymousHistorySummary(record) {
   };
 }
 
+function anonymousProjectSummary(project) {
+  const papers = Array.isArray(project.papers) ? project.papers : [];
+  return {
+    ...project,
+    local: true,
+    paper_count: papers.length,
+    completed_count: papers.filter((paper) => paper.status === "completed").length,
+    failed_count: papers.filter((paper) => paper.status === "failed").length,
+    summary: papers.map((paper) => paper.summary || paper.record?.result?.document_summary?.summary || "").find(Boolean) || "",
+  };
+}
+
 function getAnonymousRecord(localId) {
   return readAnonymousRecords().find((record) => record.local_id === localId) || null;
 }
 
+function getAnonymousProject(projectId) {
+  return readAnonymousProjects().find((project) => project.project_id === projectId) || null;
+}
+
 function deleteAnonymousRecord(localId) {
   writeAnonymousRecords(readAnonymousRecords().filter((record) => record.local_id !== localId));
+}
+
+function deleteAnonymousProject(projectId) {
+  writeAnonymousProjects(readAnonymousProjects().filter((project) => project.project_id !== projectId));
 }
 
 function setActiveLocalPdf(file) {
@@ -472,6 +1014,7 @@ function returnHome() {
   resultPanel.dataset.analysisId = "";
   resultPanel.innerHTML = "";
   statusPanel.hidden = true;
+  clearProjectUrl();
 }
 
 function switchSourceTab(source) {
@@ -721,8 +1264,8 @@ function renderArxivResults(items) {
       </div>
       <div class="arxiv-card-actions">
         <button class="arxiv-analyze" type="button" data-arxiv-index="${index}">Analyze</button>
-        <a href="${escapeAttribute(item.pdf_url || "#")}" target="_blank" rel="noreferrer">PDF</a>
-        <a href="${escapeAttribute(item.abs_url || "#")}" target="_blank" rel="noreferrer">arXiv</a>
+        <a href="${safeArxivUrl(item.pdf_url || "#")}" target="_blank" rel="noreferrer">PDF</a>
+        <a href="${safeArxivUrl(item.abs_url || "#")}" target="_blank" rel="noreferrer">arXiv</a>
       </div>
     `;
     arxivResults.appendChild(card);
@@ -766,9 +1309,26 @@ async function analyzeArxivItem(item, summaryMode, button = null) {
     }
     if (usesAnonymousHistory()) {
       setActiveLocalPdf(null);
-      saveAnonymousAnalysis(payload, `arxiv-${item.arxiv_id}.pdf`);
+      payload.analysis_id = payload.analysis_id || anonymousRecordId();
+      const project = saveAnonymousProject([{
+        result: payload,
+        displayName: `arxiv-${item.arxiv_id}.pdf`,
+      }]);
+      renderProject(project, payload.analysis_id);
+      await loadHistory();
+      return;
     }
-    renderResult(payload, `arxiv-${item.arxiv_id}.pdf`);
+    if (payload.project_id) {
+      const projectResponse = await apiFetch(`/projects/${encodeURIComponent(payload.project_id)}`);
+      if (projectResponse.ok) {
+        const project = await projectResponse.json();
+        renderProject(project, payload.analysis_id);
+      } else {
+        renderResult(payload, `arxiv-${item.arxiv_id}.pdf`);
+      }
+    } else {
+      renderResult(payload, `arxiv-${item.arxiv_id}.pdf`);
+    }
     await loadHistory();
   } catch (error) {
     renderError(error.message || "arXiv analysis failed.");
@@ -783,6 +1343,8 @@ async function analyzeArxivItem(item, summaryMode, button = null) {
 
 
 function handleResultPanelClick(event) {
+  if (handleProjectActionClick(event)) return;
+
   const reanalyzeButton = event.target.closest('[data-field="reanalyze"]');
   const scriptButton = event.target.closest('[data-field="generateVideoScript"]');
   const videoButton = event.target.closest('[data-field="generateVideo"]');
@@ -811,8 +1373,7 @@ function handleResultPanelClick(event) {
   if (!analysisId) return;
 
   if (reanalyzeButton) {
-    const reanalyzeMode = resultPanel.querySelector('[data-field="reanalyzeMode"]')?.value || "standard";
-    reanalyzeExistingAnalysis(analysisId, reanalyzeButton, reanalyzeMode);
+    confirmAndReanalyzeAnalysis(analysisId, reanalyzeButton, "standard");
     return;
   }
 
@@ -829,6 +1390,254 @@ function handleResultPanelClick(event) {
   }
   if (videoButton) {
     generateVideo(analysisId, videoContainer, videoStatus, downloadVideoLink, videoButton, slideCountControl);
+  }
+}
+
+function handleProjectActionClick(event) {
+  const projectNameButton = event.target.closest("[data-project-name-start]");
+  const paperButton = event.target.closest("[data-project-paper]");
+  const prevButton = event.target.closest("[data-project-prev]");
+  const nextButton = event.target.closest("[data-project-next]");
+  const addButton = event.target.closest("[data-project-add-papers]");
+  const renameButton = event.target.closest("[data-project-rename]");
+  const reanalyzePaperButton = event.target.closest("[data-paper-reanalyze]");
+  const reanalyzeModeButton = event.target.closest("[data-paper-reanalyze-mode]");
+  const deletePaperButton = event.target.closest("[data-paper-delete]");
+  const deleteButton = event.target.closest("[data-project-delete]");
+
+  if (projectNameButton) {
+    startProjectNameEdit();
+    return true;
+  }
+
+  if (paperButton) {
+    renderProject(currentProject, paperButton.dataset.projectPaper);
+    return true;
+  }
+
+  if ((prevButton || nextButton) && currentProject) {
+    const papers = currentProject.papers || [];
+    const currentIndex = papers.findIndex((paper) => paper.analysis_id === resultPanel.dataset.analysisId);
+    const nextIndex = currentIndex + (nextButton ? 1 : -1);
+    if (papers[nextIndex]) renderProject(currentProject, papers[nextIndex].analysis_id);
+    return true;
+  }
+
+  if (addButton) {
+    closeProjectMenus();
+    pendingAddProjectId = addButton.dataset.projectAddPapers || "";
+    switchSourceTab("upload");
+    pdfFileInput.click();
+    returnHome();
+    return true;
+  }
+
+  if (renameButton) {
+    closeProjectMenus();
+    startProjectNameEdit();
+    return true;
+  }
+
+  if (reanalyzePaperButton || reanalyzeModeButton) {
+    closeProjectMenus();
+    const trigger = reanalyzeModeButton || reanalyzePaperButton;
+    const analysisId = trigger.dataset.paperReanalyzeMode || trigger.dataset.paperReanalyze || resultPanel.dataset.analysisId;
+    const summaryMode = trigger.dataset.summaryMode || "standard";
+    confirmAndReanalyzeAnalysis(analysisId, trigger, summaryMode);
+    return true;
+  }
+
+  if (deletePaperButton) {
+    closeProjectMenus();
+    deleteCurrentPaper(deletePaperButton.dataset.paperDelete);
+    return true;
+  }
+
+  if (deleteButton) {
+    closeProjectMenus();
+    deleteCurrentProject(deleteButton.dataset.projectDelete);
+    return true;
+  }
+
+  return false;
+}
+
+function closeProjectMenus() {
+  resultPanel.querySelectorAll(".project-more-menu[open]").forEach((menu) => {
+    menu.removeAttribute("open");
+  });
+}
+
+async function deleteCurrentPaper(analysisId) {
+  if (!analysisId || !currentProject) return;
+  const paper = (currentProject.papers || []).find((item) => item.analysis_id === analysisId);
+  const displayName = paperTitleFromProjectPaper(paper) || "this paper";
+  const confirmed = window.confirm(`Delete "${displayName}" from this project?`);
+  if (!confirmed) return;
+
+  if (currentProject.local) {
+    currentProject.papers = (currentProject.papers || []).filter((item) => item.analysis_id !== analysisId);
+    deleteAnonymousPdfFile(analysisId).catch(() => {});
+    if (!currentProject.papers.length) {
+      deleteAnonymousProject(currentProject.project_id);
+      returnHome();
+      await loadHistory();
+      return;
+    }
+    currentProject.paper_count = currentProject.papers.length;
+    currentProject.completed_count = currentProject.papers.filter((item) => item.status === "completed").length;
+    currentProject.failed_count = currentProject.papers.filter((item) => item.status === "failed").length;
+    writeAnonymousProjects(readAnonymousProjects().map((project) => (
+      project.project_id === currentProject.project_id ? currentProject : project
+    )));
+    renderProject(currentProject, currentProject.papers[0].analysis_id);
+    await loadHistory();
+    return;
+  }
+
+  setBusy(true, "Deleting paper...");
+  try {
+    const response = await apiFetch(`/analyses/${encodeURIComponent(analysisId)}`, {method: "DELETE"});
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || "Could not delete paper.");
+    const projectId = currentProject.project_id;
+    await loadHistory();
+    const refreshed = await apiFetch(`/projects/${encodeURIComponent(projectId)}`);
+    if (!refreshed.ok) {
+      currentProject = null;
+      returnHome();
+      return;
+    }
+    const project = await refreshed.json();
+    renderProject(project, project.active_analysis_id);
+  } catch (error) {
+    renderError(error.message || "Could not delete paper.");
+  } finally {
+    setBusy(false);
+  }
+}
+
+resultPanel.addEventListener("keydown", (event) => {
+  const nameInput = event.target.closest("[data-project-name]");
+  if (!nameInput) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveProjectNameEdit(nameInput);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    cancelProjectNameEdit(nameInput);
+  }
+});
+
+resultPanel.addEventListener("focusout", (event) => {
+  const nameInput = event.target.closest("[data-project-name]");
+  if (!nameInput || nameInput.hidden || nameInput.dataset.cancelled === "true") return;
+  saveProjectNameEdit(nameInput);
+});
+
+function startProjectNameEdit() {
+  if (!currentProject || currentProject.legacy) return;
+  const input = resultPanel.querySelector("[data-project-name]");
+  const button = resultPanel.querySelector("[data-project-name-start]");
+  if (!input || !button) return;
+  input.value = currentProject.name || "Untitled Project";
+  input.dataset.previousName = input.value;
+  input.dataset.cancelled = "false";
+  button.hidden = true;
+  input.hidden = false;
+  input.focus();
+  input.select();
+}
+
+function cancelProjectNameEdit(input) {
+  const button = resultPanel.querySelector("[data-project-name-start]");
+  input.dataset.cancelled = "true";
+  input.value = input.dataset.previousName || currentProject?.name || "Untitled Project";
+  input.hidden = true;
+  if (button) button.hidden = false;
+}
+
+async function saveProjectNameEdit(input) {
+  if (!currentProject || currentProject.legacy || input.dataset.saving === "true") return;
+  const previousName = input.dataset.previousName || currentProject.name || "Untitled Project";
+  const name = input.value.trim();
+  const button = resultPanel.querySelector("[data-project-name-start]");
+
+  if (!name) {
+    input.value = previousName;
+    setAuthStatus("Project name cannot be empty.");
+    return;
+  }
+
+  if (name === previousName) {
+    input.hidden = true;
+    if (button) button.hidden = false;
+    return;
+  }
+
+  input.dataset.saving = "true";
+  input.disabled = true;
+  try {
+    if (currentProject.local) {
+      currentProject.name = name;
+      currentProject.updated_at = new Date().toISOString();
+      writeAnonymousProjects(readAnonymousProjects().map((project) => (
+        project.project_id === currentProject.project_id ? currentProject : project
+      )));
+    } else {
+      const response = await apiFetch(`/projects/${encodeURIComponent(currentProject.project_id)}`, {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name}),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || "Could not rename project.");
+      currentProject.name = payload.name || name;
+    }
+    if (button) {
+      button.querySelector("span").textContent = currentProject.name;
+      button.title = currentProject.name;
+      button.hidden = false;
+    }
+    input.hidden = true;
+    await loadHistory();
+  } catch (error) {
+    input.value = previousName;
+    if (button) button.hidden = false;
+    input.hidden = true;
+    setAuthStatus(error.message || "Could not rename project.");
+  } finally {
+    input.disabled = false;
+    delete input.dataset.saving;
+  }
+}
+
+async function deleteCurrentProject(projectId) {
+  if (!projectId || !currentProject) return;
+  const displayName = currentProject.name || "this project";
+  const confirmed = window.confirm(`Delete "${displayName}" and all papers in this project?`);
+  if (!confirmed) return;
+
+  if (currentProject.local) {
+    deleteAnonymousProjectPdfFiles(currentProject).catch(() => {});
+    deleteAnonymousProject(projectId);
+    returnHome();
+    await loadHistory();
+    return;
+  }
+
+  setBusy(true, "Deleting project...");
+  try {
+    const response = await apiFetch(`/projects/${encodeURIComponent(projectId)}`, {method: "DELETE"});
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || "Could not delete project.");
+    currentProject = null;
+    returnHome();
+    await loadHistory();
+  } catch (error) {
+    renderError(error.message || "Could not delete project.");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -857,9 +1666,8 @@ async function reanalyzeExistingAnalysis(analysisId, button, summaryMode = "stan
     renderError(authMessage);
     return;
   }
-  const modeControl = resultPanel.querySelector('[data-field="reanalyzeMode"]');
+  const originalButtonText = button.textContent;
   button.disabled = true;
-  if (modeControl) modeControl.disabled = true;
   button.textContent = "Reanalyzing";
   setBusy(true, `Creating a new ${formatMode(summaryMode).toLowerCase()} version...`);
 
@@ -874,16 +1682,42 @@ async function reanalyzeExistingAnalysis(analysisId, button, summaryMode = "stan
     if (!response.ok) {
       throw new Error(payload.detail || `Reanalysis failed with status ${response.status}`);
     }
-    renderResult(payload, "Reanalyzed paper");
+    if (currentProject?.project_id && !currentProject.local) {
+      const projectResponse = await apiFetch(`/projects/${encodeURIComponent(currentProject.project_id)}`);
+      if (projectResponse.ok) {
+        const project = await projectResponse.json();
+        renderProject(project, payload.analysis_id);
+      } else {
+        renderResult(payload, "Reanalyzed paper");
+      }
+    } else {
+      renderResult(payload, "Reanalyzed paper");
+    }
     await loadHistory();
   } catch (error) {
     renderError(error.message || "Reanalysis failed.");
   } finally {
     button.disabled = false;
-    if (modeControl) modeControl.disabled = false;
-    button.textContent = "Reanalyze as New";
+    button.textContent = originalButtonText || "Reanalyze";
     setBusy(false);
   }
+}
+
+function confirmAndReanalyzeAnalysis(analysisId, button, summaryMode = "standard") {
+  if (!analysisId) return;
+  const authMessage = requireAuthMessage();
+  if (authMessage) {
+    renderError(authMessage);
+    return;
+  }
+  const nextMode = normalizeSummaryMode(summaryMode);
+  const currentMode = normalizeSummaryMode(currentAnalysisSummaryMode());
+  const confirmed = window.confirm(
+    `Reanalyze this paper in ${formatAnalysisModeName(nextMode)} mode? ` +
+    `This will create a new analysis. The current ${formatAnalysisModeName(currentMode)} analysis will remain available in history.`,
+  );
+  if (!confirmed) return;
+  reanalyzeExistingAnalysis(analysisId, button, nextMode);
 }
 
 function handleResultPanelChange(event) {
@@ -893,10 +1727,16 @@ function handleResultPanelChange(event) {
 
 function setBusy(isBusy, message = "") {
   document.body.classList.toggle("is-busy", isBusy);
+  pdfFileInput.disabled = isBusy;
+  folderButton.disabled = isBusy;
+  addFilesButton.disabled = isBusy;
+  clearUploadButton.disabled = isBusy;
   analyzeButton.disabled = isBusy;
   analyzeButton.classList.toggle("is-loading", isBusy);
   analyzeButton.setAttribute("aria-busy", String(isBusy));
-  analyzeButton.textContent = "Analyze Paper";
+  if (!isBusy) {
+    renderUploadState();
+  }
   statusText.textContent = message;
   statusPanel.hidden = !isBusy;
 }
@@ -915,10 +1755,246 @@ function renderError(message) {
   `;
 }
 
-function renderResult(result, fallbackFilename = "Analysis Result") {
+function paperTitleFromResult(result, fallbackFilename = "Untitled Paper") {
+  const summary = result?.document_summary || {};
+  const source = result?.source_metadata || {};
+  return source.title || result?.paper_title || summary.title || fallbackFilename || "Untitled Paper";
+}
+
+function paperTitleFromProjectPaper(paper) {
+  const result = paper?.record?.result || {};
+  return paper.paper_title || paperTitleFromResult(result, paper.filename || "Untitled Paper");
+}
+
+function paperResultFromProjectPaper(paper) {
+  const record = paper?.record || {};
+  const result = record.result || paper.result || {};
+  if (paper.analysis_id && !result.analysis_id) result.analysis_id = paper.analysis_id;
+  return result;
+}
+
+function singlePaperProjectFromResult(result, fallbackFilename = "Analysis Result") {
+  const analysisId = result?.analysis_id || "";
+  const now = result?.generated_at || result?.submitted_at || new Date().toISOString();
+  const paper = {
+    legacy: true,
+    analysis_id: analysisId,
+    project_id: result?.project_id || `legacy-${analysisId || anonymousRecordId()}`,
+    filename: fallbackFilename,
+    paper_title: paperTitleFromResult(result, fallbackFilename),
+    created_at: now,
+    updated_at: now,
+    status: "completed",
+    record: {
+      legacy: true,
+      analysis_id: analysisId,
+      project_id: result?.project_id || "",
+      filename: fallbackFilename,
+      created_at: now,
+      updated_at: now,
+      status: "completed",
+      result,
+    },
+  };
+  return {
+    legacy: true,
+    project_id: paper.project_id,
+    name: "Untitled Project",
+    created_at: now,
+    updated_at: now,
+    paper_count: 1,
+    completed_count: 1,
+    failed_count: 0,
+    active_analysis_id: analysisId,
+    papers: [paper],
+  };
+}
+
+function renderProject(project, activeAnalysisId = "") {
+  const papers = Array.isArray(project?.papers) ? project.papers : [];
+  const completedPapers = papers.filter((paper) => (paper.status || "completed") === "completed");
+  const activePaper = (
+    papers.find((paper) => paper.analysis_id === activeAnalysisId)
+    || completedPapers[0]
+    || papers[0]
+  );
+
+  currentProject = project;
+  if (!activePaper) {
+    renderError("This project has no papers.");
+    return;
+  }
+
+  const localFile = projectLocalFiles.get(activePaper.analysis_id) || null;
+  setActiveLocalPdf(localFile || null);
+
+  if ((activePaper.status || "completed") !== "completed") {
+    renderProjectShell(project, activePaper);
+    return;
+  }
+
+  renderResult(paperResultFromProjectPaper(activePaper), activePaper.filename || "Saved Analysis", {
+    project,
+    activeAnalysisId: activePaper.analysis_id,
+    localPdfFile: localFile,
+    localPdfMissing: Boolean(project.local && !localFile),
+  });
+  if (project.local && !localFile) {
+    getAnonymousPdfFile(activePaper.analysis_id, activePaper.filename || "paper.pdf")
+      .then((storedFile) => {
+        if (currentProject?.project_id !== project.project_id) return;
+        if (resultPanel.dataset.analysisId !== activePaper.analysis_id) return;
+        if (!storedFile) {
+          const placeholder = resultPanel.querySelector('[data-field="pdfPlaceholder"]');
+          if (placeholder) {
+            placeholder.textContent = "Original PDF was not found in this browser. Re-upload the PDF or sign in to save future papers across sessions.";
+          }
+          return;
+        }
+        projectLocalFiles.set(activePaper.analysis_id, storedFile);
+        renderProject(project, activePaper.analysis_id);
+      })
+      .catch(() => {});
+  }
+  updateProjectUrl(project.project_id, activePaper.analysis_id);
+}
+
+function renderProjectShell(project, activePaper) {
+  document.body.classList.add("has-result");
+  document.body.classList.add("source-collapsed");
+  resultPanel.className = "result-panel";
+  resultPanel.dataset.analysisId = activePaper.analysis_id || "";
+  resultPanel.innerHTML = "";
+  resultPanel.appendChild(createProjectNavigator(project, activePaper.analysis_id));
+  const message = document.createElement("div");
+  message.className = "project-empty-state";
+  message.innerHTML = `
+    <p class="eyebrow">${escapeHtml(activePaper.status || "Queued")}</p>
+    <h2>${escapeHtml(paperTitleFromProjectPaper(activePaper))}</h2>
+    <p class="result-meta">${escapeHtml(activePaper.error || "This paper is not completed yet.")}</p>
+    <button class="ghost-button compact-action" type="button" data-project-add-papers="${escapeHtml(project.project_id)}">Retry / Add papers</button>
+  `;
+  resultPanel.appendChild(message);
+  updateProjectUrl(project.project_id, activePaper.analysis_id);
+}
+
+function createProjectNavigator(project, activeAnalysisId) {
+  const papers = Array.isArray(project.papers) ? project.papers : [];
+  const activeIndex = Math.max(0, papers.findIndex((paper) => paper.analysis_id === activeAnalysisId));
+  const activePaper = papers[activeIndex] || papers[0] || {};
+  const updatedAt = project.updated_at || project.created_at || "";
+  const projectName = project.name || "Untitled Project";
+  const activePaperTitle = paperTitleFromProjectPaper(activePaper);
+  const wrapper = document.createElement("section");
+  wrapper.className = `project-nav ${papers.length <= 1 ? "single-paper" : ""}`;
+  wrapper.innerHTML = `
+    <div class="project-header-row">
+      <div class="project-title-block">
+        <button class="project-name-button" type="button" data-project-name-start title="${escapeAttribute(projectName)}" ${project.legacy ? "disabled" : ""}>
+          <span>${escapeHtml(projectName)}</span>
+          <span class="project-name-edit-icon" aria-hidden="true">Edit</span>
+        </button>
+        <input class="project-name-input" value="${escapeHtml(projectName)}" data-project-name aria-label="Project name" hidden />
+        <div class="project-status-summary">
+          <span>${escapeHtml(String(papers.length))} paper${papers.length === 1 ? "" : "s"}</span>
+          <span>Updated ${escapeHtml(formatDate(updatedAt))}</span>
+        </div>
+      </div>
+      <div class="project-active-title" title="${escapeAttribute(activePaperTitle)}">${escapeHtml(activePaperTitle)}</div>
+      <div class="project-actions">
+        <span class="analysis-mode-badge" data-field="analysisModeBadge">${escapeHtml(formatAnalysisModeBadge(activePaper.record?.result?.summary_mode || activePaper.summary_mode))}</span>
+        <button class="primary-button compact-action" type="button" data-project-add-papers="${escapeHtml(project.project_id)}" ${project.legacy ? "disabled" : ""}>Add Papers</button>
+        <details class="project-more-menu">
+          <summary class="ghost-button icon-button" aria-label="More project actions">⋯</summary>
+          <div class="project-more-list">
+            <button type="button" data-project-rename ${project.legacy ? "disabled" : ""}>Rename Project</button>
+            <button type="button" data-project-add-papers="${escapeHtml(project.project_id)}" ${project.legacy ? "disabled" : ""}>Add Papers</button>
+            <details class="workspace-reanalyze-menu">
+              <summary>Reanalyze</summary>
+              <div class="workspace-submenu-list">
+                <button type="button" data-paper-reanalyze-mode="${escapeHtml(activePaper.analysis_id || "")}" data-summary-mode="paragraph">Quick</button>
+                <button type="button" data-paper-reanalyze-mode="${escapeHtml(activePaper.analysis_id || "")}" data-summary-mode="standard">Standard</button>
+                <button type="button" data-paper-reanalyze-mode="${escapeHtml(activePaper.analysis_id || "")}" data-summary-mode="one_page">Detailed</button>
+              </div>
+            </details>
+            <details class="download-menu workspace-download-menu">
+              <summary>Download</summary>
+              <div class="download-menu-list">
+                <p>Analysis</p>
+                <a data-field="downloadMarkdown" href="#" download>Markdown</a>
+                <a data-field="download" href="#" download>JSON</a>
+                <p>Slides</p>
+                <a data-field="downloadSlidesHtml" href="#" download hidden>HTML</a>
+                <a data-field="downloadSlides" href="#" download hidden>Markdown</a>
+                <a data-field="downloadScript" href="#" download hidden>JSON</a>
+                <a data-field="downloadVideo" href="#" download hidden>Narrated MP4</a>
+                <p>Document</p>
+                <a data-field="downloadPdf" href="#" download hidden>Original PDF</a>
+              </div>
+            </details>
+            <button type="button" disabled>Duplicate</button>
+            <button type="button" disabled>Compare Papers</button>
+            <button class="danger-action" type="button" data-paper-delete="${escapeHtml(activePaper.analysis_id || "")}">Delete Paper</button>
+            <button class="danger-action" type="button" data-project-delete="${escapeHtml(project.project_id)}">Delete Project</button>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div class="paper-nav-row" ${papers.length <= 1 ? "hidden" : ""}>
+      <div class="paper-selector">
+        <span class="project-section-label">Papers</span>
+        <div class="project-paper-list">
+          ${papers.map((paper) => `
+            <button class="project-paper-item ${paper.analysis_id === activeAnalysisId ? "active" : ""}" type="button" data-project-paper="${escapeHtml(paper.analysis_id || "")}" title="${escapeAttribute(paperTitleFromProjectPaper(paper))}">
+              <span>${escapeHtml(paperTitleFromProjectPaper(paper))}</span>
+              <small>${escapeHtml(formatPaperStatus(paper.status || "completed"))}</small>
+            </button>
+          `).join("")}
+          ${papers.length > 1 ? '<button class="compare-tab" type="button" disabled>Compare</button>' : ""}
+        </div>
+      </div>
+      <div class="paper-stepper">
+        <button class="ghost-button compact-action" type="button" data-project-prev ${activeIndex <= 0 ? "disabled" : ""}>‹ Previous</button>
+        <div class="paper-navigator-current">
+          <span>Paper ${escapeHtml(String(activeIndex + 1))} of ${escapeHtml(String(papers.length))}</span>
+        </div>
+        <button class="ghost-button compact-action" type="button" data-project-next ${activeIndex >= papers.length - 1 ? "disabled" : ""}>Next ›</button>
+      </div>
+    </div>
+  `;
+  return wrapper;
+}
+
+function formatPaperStatus(status) {
+  const normalized = String(status || "completed").toLowerCase();
+  if (normalized === "completed") return "Completed";
+  if (normalized === "failed") return "Failed";
+  if (normalized === "analyzing") return "Analyzing";
+  return "Processing";
+}
+
+function updateProjectUrl(projectId, analysisId) {
+  if (!projectId || !analysisId) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("project", projectId);
+  url.searchParams.set("paper", analysisId);
+  window.history.replaceState({}, "", url);
+}
+
+function clearProjectUrl() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("project") && !url.searchParams.has("paper")) return;
+  url.searchParams.delete("project");
+  url.searchParams.delete("paper");
+  window.history.replaceState({}, "", url);
+}
+
+function renderResult(result, fallbackFilename = "Analysis Result", options = {}) {
   document.body.classList.add("has-result");
   document.body.classList.add("source-collapsed");
   const node = resultTemplate.content.cloneNode(true);
+  const workspaceProject = options.project || singlePaperProjectFromResult(result, fallbackFilename);
+  currentProject = workspaceProject;
   const summary = result.document_summary || {};
   const source = result.source_metadata || {};
   const analysisId = result.analysis_id;
@@ -933,27 +2009,6 @@ function renderResult(result, fallbackFilename = "Analysis Result") {
   renderSummaryText(node.querySelector('[data-field="summary"]'), summaryText);
   node.querySelector('[data-field="overviewMeta"]').textContent = formatOverviewMeta(result, summaryText);
   renderPaperInfo(node.querySelector('[data-field="paperInfo"]'), result, fallbackFilename);
-
-  const download = node.querySelector('[data-field="download"]');
-  const downloadMarkdown = node.querySelector('[data-field="downloadMarkdown"]');
-  const reanalyzeButton = node.querySelector('[data-field="reanalyze"]');
-  const reanalyzeMode = node.querySelector('[data-field="reanalyzeMode"]');
-  if (reanalyzeMode) reanalyzeMode.value = normalizeSummaryMode(result.summary_mode);
-  if (analysisId) {
-    download.href = withAccessToken(`/analyses/${analysisId}/download`);
-    downloadMarkdown.href = withAccessToken(`/analyses/${analysisId}/markdown/download`);
-    downloadMarkdown.download = "";
-    download.download = "";
-  } else {
-    download.removeAttribute("href");
-    downloadMarkdown.removeAttribute("href");
-    if (reanalyzeButton) reanalyzeButton.disabled = true;
-    if (reanalyzeMode) reanalyzeMode.disabled = true;
-  }
-  renderPdfViewer(node, analysisId, {
-    preferLocalPdf: Boolean(activeLocalPdfUrl),
-    fallbackPdfUrl: source.pdf_url || "",
-  });
 
   renderList(node.querySelector('[data-field="keyIdeas"]'), summary.key_ideas || [], {variant: "ideas", limit: 5});
   renderList(node.querySelector('[data-field="contributions"]'), summary.contributions || [], {variant: "contributions", limit: 5});
@@ -970,16 +2025,9 @@ function renderResult(result, fallbackFilename = "Analysis Result") {
   const videoStatus = node.querySelector('[data-field="videoStatus"]');
   const videoButton = node.querySelector('[data-field="generateVideoScript"]');
   const generateVideoButton = node.querySelector('[data-field="generateVideo"]');
-  const downloadScriptLink = node.querySelector('[data-field="downloadScript"]');
-  const downloadSlidesLink = node.querySelector('[data-field="downloadSlides"]');
-  const downloadSlidesHtmlLink = node.querySelector('[data-field="downloadSlidesHtml"]');
-  const downloadVideoLink = node.querySelector('[data-field="downloadVideo"]');
   const slideCountControl = node.querySelector('[data-field="slideCount"]');
   renderVideoScript(videoContainer, result.video_script);
-  renderVideoScriptDownload(downloadScriptLink, downloadSlidesLink, downloadSlidesHtmlLink, analysisId, result.video_script);
-  renderVideoResult(videoStatus, downloadVideoLink, result.video);
   syncSlideCount(slideCountControl, result.video_script);
-  updateVideoArtifactAvailability(node);
   if (!analysisId) {
     videoButton.disabled = true;
     generateVideoButton.disabled = true;
@@ -990,6 +2038,33 @@ function renderResult(result, fallbackFilename = "Analysis Result") {
   resultPanel.dataset.analysisId = analysisId || "";
   resultPanel.innerHTML = "";
   resultPanel.appendChild(node);
+  resultPanel.classList.add("project-workspace");
+  resultPanel.prepend(createProjectNavigator(workspaceProject, options.activeAnalysisId || analysisId));
+  const download = resultPanel.querySelector('[data-field="download"]');
+  const downloadMarkdown = resultPanel.querySelector('[data-field="downloadMarkdown"]');
+  const downloadScriptLink = resultPanel.querySelector('[data-field="downloadScript"]');
+  const downloadSlidesLink = resultPanel.querySelector('[data-field="downloadSlides"]');
+  const downloadSlidesHtmlLink = resultPanel.querySelector('[data-field="downloadSlidesHtml"]');
+  const downloadVideoLink = resultPanel.querySelector('[data-field="downloadVideo"]');
+  const modeBadge = resultPanel.querySelector('[data-field="analysisModeBadge"]');
+  if (modeBadge) modeBadge.textContent = formatAnalysisModeBadge(result.summary_mode);
+  if (analysisId && download && downloadMarkdown) {
+    download.href = withAccessToken(`/analyses/${analysisId}/download`);
+    downloadMarkdown.href = withAccessToken(`/analyses/${analysisId}/markdown/download`);
+    downloadMarkdown.download = "";
+    download.download = "";
+  } else {
+    if (download) download.removeAttribute("href");
+    if (downloadMarkdown) downloadMarkdown.removeAttribute("href");
+  }
+  renderVideoScriptDownload(downloadScriptLink, downloadSlidesLink, downloadSlidesHtmlLink, analysisId, result.video_script);
+  renderVideoResult(videoStatus, downloadVideoLink, result.video);
+  renderPdfViewer(resultPanel, analysisId, {
+    preferLocalPdf: Boolean(options.localPdfFile && activeLocalPdfUrl),
+    fallbackPdfUrl: source.pdf_url || "",
+    localPdfMissing: Boolean(options.localPdfMissing),
+  });
+  updateVideoArtifactAvailability(resultPanel);
   bindTabs(resultPanel);
 }
 
@@ -1022,6 +2097,19 @@ function renderPdfViewer(root, analysisId, options = {}) {
       downloadPdf.hidden = false;
       downloadPdf.href = options.fallbackPdfUrl;
       downloadPdf.download = "";
+    }
+    return;
+  }
+
+  if (options.localPdfMissing) {
+    panel.dataset.pdfBaseUrl = "";
+    viewer.hidden = true;
+    viewer.removeAttribute("src");
+    placeholder.hidden = false;
+    placeholder.textContent = "Restoring the browser-only PDF from this device...";
+    if (downloadPdf) {
+      downloadPdf.hidden = true;
+      downloadPdf.removeAttribute("href");
     }
     return;
   }
@@ -1111,6 +2199,9 @@ function navigateToEvidencePage(page, activeEvidenceItem = null) {
 }
 
 function pdfViewerUrl(pdfUrl, page) {
+  if (String(pdfUrl || "").startsWith("blob:")) {
+    return `${pdfUrl}#page=${encodeURIComponent(page)}`;
+  }
   const separator = pdfUrl.includes("?") ? "&" : "?";
   return `${pdfUrl}${separator}view=${Date.now()}#page=${encodeURIComponent(page)}`;
 }
@@ -1670,18 +2761,32 @@ function bindTabs(root) {
 
 async function loadHistory() {
   if (usesAnonymousHistory()) {
-    historyItems = readAnonymousRecords().map(anonymousHistorySummary);
+    const projectItems = readAnonymousProjects().map(anonymousProjectSummary);
+    const legacyItems = readAnonymousRecords().map((record) => {
+      const summary = anonymousHistorySummary(record);
+      return {
+        ...summary,
+        project_id: `legacy-${summary.local_id}`,
+        name: summary.paper_title || summary.filename || "Untitled Paper",
+        paper_count: 1,
+        completed_count: 1,
+        failed_count: 0,
+        active_analysis_id: summary.local_id,
+        legacy: true,
+      };
+    });
+    historyItems = [...projectItems, ...legacyItems];
     renderFilteredHistory();
     return;
   }
   try {
-    const response = await apiFetch("/analyses");
+    const response = await apiFetch("/projects");
     if (!response.ok) {
       throw new Error("Could not load history.");
     }
 
     const payload = await response.json();
-    historyItems = payload.analyses || [];
+    historyItems = payload.projects || [];
     renderFilteredHistory();
   } catch (error) {
     historyList.innerHTML = `<p class="result-meta">${escapeHtml(error.message)}</p>`;
@@ -1693,8 +2798,9 @@ function renderFilteredHistory() {
   const mode = historyModeFilter.value;
   const date = historyDateFilter.value;
   const filteredItems = historyItems.filter((item) => {
-    const modeMatches = mode === "all" || item.summary_mode === mode;
-    const dateMatches = !date || historyDateKey(item.created_at) === date;
+    const papers = Array.isArray(item.papers) ? item.papers : [];
+    const modeMatches = mode === "all" || papers.some((paper) => paper.summary_mode === mode) || item.summary_mode === mode;
+    const dateMatches = !date || historyDateKey(item.updated_at || item.created_at) === date;
     const queryMatches = !query || historySearchText(item).includes(query);
     return modeMatches && dateMatches && queryMatches;
   });
@@ -1705,62 +2811,108 @@ function renderFilteredHistory() {
 function renderHistory(items) {
   historyList.innerHTML = "";
   if (!historyItems.length) {
-    historyList.innerHTML = '<p class="result-meta">No saved analyses yet.</p>';
+    historyList.innerHTML = '<p class="result-meta">No saved projects yet.</p>';
     return;
   }
 
   if (!items.length) {
-    historyList.innerHTML = '<p class="result-meta">No analyses match the current search or filter.</p>';
+    historyList.innerHTML = '<p class="result-meta">No projects match the current search or filter.</p>';
     return;
   }
 
   items.forEach((item) => {
     const card = document.createElement("article");
     card.className = "history-item";
-    const displayTitle = item.paper_title || item.filename || "Untitled PDF";
-    const itemId = item.local ? item.local_id : item.analysis_id;
+    const displayTitle = item.name || item.paper_title || item.filename || "Untitled Project";
+    const itemId = item.project_id || item.analysis_id || item.local_id;
+    const paperCount = Number(item.paper_count || item.papers?.length || 1);
+    const completedCount = Number(item.completed_count || 0);
+    const failedCount = Number(item.failed_count || 0);
+    const statusSummary = `${paperCount} paper${paperCount === 1 ? "" : "s"} · ${completedCount} completed${failedCount ? ` · ${failedCount} failed` : ""}`;
     const downloadAction = item.local
       ? '<span class="result-meta">Browser only</span>'
-      : `<a href="${withAccessToken(`/analyses/${encodeURIComponent(item.analysis_id || "")}/download`)}">Download</a>`;
+      : "";
     card.innerHTML = `
       <strong>${escapeHtml(displayTitle)}</strong>
-      ${item.paper_title && item.filename ? `<p class="result-meta">${escapeHtml(item.filename)}</p>` : ""}
-      <p>${escapeHtml(formatMode(item.summary_mode))} · ${escapeHtml(formatDate(item.created_at))} · ${escapeHtml(formatSeconds(item.processing_seconds))}</p>
+      <p class="result-meta">${escapeHtml(statusSummary)} · ${escapeHtml(formatDate(item.updated_at || item.created_at))}</p>
       <p>${escapeHtml(trimText(item.summary || "", 145))}</p>
       <div class="history-actions">
         <button type="button" data-open="${escapeHtml(itemId || "")}">Open</button>
         ${downloadAction}
+        <button type="button" data-rename-project="${escapeHtml(itemId || "")}" ${item.local || item.legacy ? "disabled" : ""}>Rename</button>
         <button class="danger-action" type="button" data-delete="${escapeHtml(itemId || "")}">Delete</button>
       </div>
     `;
     card.querySelector("[data-open]").addEventListener("click", () => openAnalysisItem(item));
     card.querySelector("[data-delete]").addEventListener("click", () => deleteHistoryItem(item));
+    card.querySelector("[data-rename-project]")?.addEventListener("click", () => renameHistoryProject(item));
     historyList.appendChild(card);
   });
 }
 
 function historySearchText(item) {
+  const paperText = Array.isArray(item.papers)
+    ? item.papers.map((paper) => [paper.paper_title, paper.filename, paper.summary].join(" ")).join(" ")
+    : "";
   return normalizeSearch([
+    item.name,
     item.paper_title,
     item.filename,
     item.summary,
+    paperText,
     formatMode(item.summary_mode),
-    formatDate(item.created_at),
+    formatDate(item.updated_at || item.created_at),
   ].join(" "));
 }
 
 async function openAnalysisItem(item) {
-  if (item?.local) {
+  if (item?.local && item?.papers) {
+    const project = getAnonymousProject(item.project_id);
+    if (!project) {
+      renderError("This browser-only project was not found.");
+      return;
+    }
+    renderProject(project, project.active_analysis_id);
+    return;
+  }
+  if (item?.legacy && item?.local) {
+    const localId = String(item.project_id || "").replace("legacy-", "");
     const record = getAnonymousRecord(item.local_id);
-    if (!record) {
+    const fallbackRecord = getAnonymousRecord(localId);
+    const selectedRecord = record || fallbackRecord;
+    if (!selectedRecord) {
       renderError("This browser-only analysis was not found.");
       return;
     }
     setActiveLocalPdf(null);
-    renderResult(record.result || {}, record.filename || "Browser Analysis");
+    renderResult(selectedRecord.result || {}, selectedRecord.filename || "Browser Analysis");
     return;
   }
-  return openAnalysis(item?.analysis_id);
+  return openProject(item?.project_id, item?.active_analysis_id);
+}
+
+async function openProject(projectId, analysisId = "") {
+  if (!projectId) return;
+  const authMessage = requireAuthMessage();
+  if (authMessage) {
+    renderError(authMessage);
+    return;
+  }
+
+  setBusy(true, "Loading project...");
+  try {
+    const response = await apiFetch(`/projects/${encodeURIComponent(projectId)}`);
+    if (!response.ok) {
+      throw new Error("Project was not found.");
+    }
+
+    const project = await response.json();
+    renderProject(project, analysisId || project.active_analysis_id);
+  } catch (error) {
+    renderError(error.message);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function openAnalysis(analysisId) {
@@ -1790,16 +2942,17 @@ async function openAnalysis(analysisId) {
 }
 
 async function deleteHistoryItem(item) {
+  const projectId = item?.project_id;
   const analysisId = item?.analysis_id;
   const localId = item?.local_id;
-  if (!analysisId && !localId) return;
-  if (item?.local) {
-    const displayTitle = item.paper_title || item.filename || "this analysis";
+  if (!projectId && !analysisId && !localId) return;
+  if (item?.local && item?.papers) {
+    const displayTitle = item.name || "this project";
     const confirmed = window.confirm(`Delete "${displayTitle}" from this browser?`);
     if (!confirmed) return;
-    deleteAnonymousRecord(localId);
-    historyItems = readAnonymousRecords().map(anonymousHistorySummary);
-    renderFilteredHistory();
+    deleteAnonymousProjectPdfFiles(getAnonymousProject(projectId)).catch(() => {});
+    deleteAnonymousProject(projectId);
+    await loadHistory();
     return;
   }
   const authMessage = requireAuthMessage();
@@ -1808,29 +2961,48 @@ async function deleteHistoryItem(item) {
     return;
   }
 
-  const displayTitle = item.paper_title || item.filename || "this analysis";
-  const confirmed = window.confirm(`Delete "${displayTitle}" and its stored PDF / generated files from this server?`);
+  const displayTitle = item.name || item.paper_title || item.filename || "this project";
+  const confirmed = window.confirm(`Delete "${displayTitle}" and its stored PDFs / generated files from this server?`);
   if (!confirmed) return;
 
-  setBusy(true, "Deleting saved analysis...");
+  setBusy(true, "Deleting project...");
   try {
-    const response = await apiFetch(`/analyses/${encodeURIComponent(analysisId)}`, {
+    const endpoint = projectId ? `/projects/${encodeURIComponent(projectId)}` : `/analyses/${encodeURIComponent(analysisId)}`;
+    const response = await apiFetch(endpoint, {
       method: "DELETE",
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.detail || "Could not delete this analysis.");
+      throw new Error(payload.detail || "Could not delete this project.");
     }
 
-    historyItems = historyItems.filter((entry) => entry.analysis_id !== analysisId);
+    historyItems = historyItems.filter((entry) => entry.project_id !== projectId);
     renderFilteredHistory();
-    if (resultPanel.dataset.analysisId === analysisId) {
+    if (currentProject?.project_id === projectId || resultPanel.dataset.analysisId === analysisId) {
       returnHome();
     }
   } catch (error) {
-    renderError(error.message || "Could not delete this analysis.");
+    renderError(error.message || "Could not delete this project.");
   } finally {
     setBusy(false);
+  }
+}
+
+async function renameHistoryProject(item) {
+  if (!item?.project_id || item.local || item.legacy) return;
+  const nextName = window.prompt("Project name", item.name || "Untitled Project");
+  if (!nextName || nextName.trim() === item.name) return;
+  try {
+    const response = await apiFetch(`/projects/${encodeURIComponent(item.project_id)}`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name: nextName.trim()}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || "Could not rename project.");
+    await loadHistory();
+  } catch (error) {
+    renderError(error.message || "Could not rename project.");
   }
 }
 
@@ -1841,6 +3013,25 @@ function formatMode(mode) {
     one_page: "Detailed summary",
   };
   return labels[mode] || "Standard summary";
+}
+
+function formatAnalysisModeName(mode) {
+  const labels = {
+    paragraph: "Quick",
+    standard: "Standard",
+    one_page: "Detailed",
+  };
+  return labels[normalizeSummaryMode(mode)] || "Standard";
+}
+
+function formatAnalysisModeBadge(mode) {
+  return `${formatAnalysisModeName(mode)} analysis`;
+}
+
+function currentAnalysisSummaryMode() {
+  const analysisId = resultPanel.dataset.analysisId || "";
+  const paper = (currentProject?.papers || []).find((item) => item.analysis_id === analysisId);
+  return paper?.record?.result?.summary_mode || paper?.summary_mode || "standard";
 }
 
 function normalizeSummaryMode(mode) {
@@ -2018,6 +3209,10 @@ function escapeHtml(value) {
 }
 
 function escapeAttribute(value) {
+  return escapeHtml(value);
+}
+
+function safeArxivUrl(value) {
   const text = String(value || "");
   if (!/^https:\/\/(arxiv\.org|www\.arxiv\.org|export\.arxiv\.org)\//.test(text)) {
     return "#";
