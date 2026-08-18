@@ -42,13 +42,13 @@
           <div class="source-panel active" data-source-panel="upload">
             <form id="uploadForm" class="upload-form">
               <div id="uploadDropZone" class="drop-zone">
-                <input id="pdfFile" name="file" type="file" accept="application/pdf" multiple />
+                <input id="pdfFile" name="file" type="file" accept="application/pdf,.pdf,.md,.markdown,text/markdown,.txt,text/plain,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple />
                 <div class="upload-empty-state" data-upload-empty>
-                  <span class="drop-icon">PDF</span>
+                  <span class="drop-icon">DOC</span>
                   <span class="drop-title">Upload research papers</span>
-                  <span class="drop-meta">Drag and drop PDF files here, or</span>
-                  <button id="folderButton" class="folder-button" type="button">Choose PDFs</button>
-                  <span class="drop-note">PDF only · Up to 10 files</span>
+                  <span class="drop-meta">Drag and drop files here, or</span>
+                  <button id="folderButton" class="folder-button" type="button">Choose Files</button>
+                  <span class="drop-note">PDF, DOCX, MD, TXT · Up to 10 files</span>
                 </div>
                 <div class="upload-selected-state" data-upload-selected hidden>
                   <div id="fileLabel" class="upload-ready-title">0 PDFs ready</div>
@@ -350,9 +350,9 @@
         </div>
 
         <aside class="pdf-panel" data-field="pdfPanel">
-          <iframe data-field="pdfViewer" title="Original PDF viewer"></iframe>
+          <iframe data-field="pdfViewer" title="Original document viewer"></iframe>
           <div class="pdf-placeholder" data-field="pdfPlaceholder" hidden>
-            Original PDF is not available for this analysis.
+            Original document is not available for this analysis.
           </div>
         </aside>
       </div>

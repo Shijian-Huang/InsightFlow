@@ -106,11 +106,28 @@ let arxivSearchState = {
 
 initAuth();
 
+const SUPPORTED_EXTENSIONS = new Set([".pdf", ".md", ".markdown", ".txt", ".docx"]);
+const SUPPORTED_MIME_TYPES = new Set([
+  "application/pdf",
+  "text/markdown",
+  "text/plain",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
+
+function isSupportedFile(file) {
+  if (!file) return false;
+  if (SUPPORTED_MIME_TYPES.has(file.type)) return true;
+  const name = file.name.toLowerCase();
+  return Array.from(SUPPORTED_EXTENSIONS).some((ext) => name.endsWith(ext));
+}
+
 function isPdfFile(file) {
-  return Boolean(file) && (
-    file.type === "application/pdf" ||
-    file.name.toLowerCase().endsWith(".pdf")
-  );
+  return isSupportedFile(file);
+}
+
+function fileExtension(filename) {
+  const dot = String(filename || "").lastIndexOf(".");
+  return dot >= 0 ? String(filename).slice(dot).toLowerCase() : "";
 }
 
 function uploadDisplayName(file) {
@@ -118,7 +135,7 @@ function uploadDisplayName(file) {
 }
 
 function selectedUploadFiles() {
-  return uploadFiles.filter(isPdfFile);
+  return uploadFiles.filter(isSupportedFile);
 }
 
 function formatFileSize(bytes) {
@@ -139,7 +156,7 @@ function setUploadFiles(files, { append = false } = {}) {
   const nextFiles = append ? [...uploadFiles] : [];
   const seen = new Set(nextFiles.map(uploadFileKey));
 
-  for (const file of files.filter(isPdfFile)) {
+  for (const file of files.filter(isSupportedFile)) {
     const key = uploadFileKey(file);
     if (seen.has(key)) continue;
     nextFiles.push(file);
@@ -176,8 +193,8 @@ function renderUploadState() {
     return;
   }
 
-  fileLabel.textContent = `${files.length} PDF${files.length === 1 ? "" : "s"} ready`;
-  analyzeButton.textContent = `Analyze ${files.length} PDF${files.length === 1 ? "" : "s"}`;
+  fileLabel.textContent = `${files.length} file${files.length === 1 ? "" : "s"} ready`;
+  analyzeButton.textContent = `Analyze ${files.length} file${files.length === 1 ? "" : "s"}`;
   uploadFileList.innerHTML = files.map((file, index) => `
     <div class="upload-file-row">
       <span class="upload-file-name">${escapeHtml(uploadDisplayName(file))}</span>
@@ -283,10 +300,10 @@ async function droppedFilesFromEvent(event) {
 
   if (entries.length) {
     const files = await Promise.all(entries.map((entry) => readDroppedEntry(entry)));
-    return files.flat().filter(isPdfFile);
+    return files.flat().filter(isSupportedFile);
   }
 
-  return Array.from(event.dataTransfer?.files || []).filter(isPdfFile);
+  return Array.from(event.dataTransfer?.files || []).filter(isSupportedFile);
 }
 
 pdfFileInput.addEventListener("change", () => {
@@ -606,7 +623,7 @@ async function saveAnonymousPdfFile(analysisId, file) {
       analysis_id: analysisId,
       file,
       filename: uploadDisplayName(file),
-      type: file.type || "application/pdf",
+      type: file.type || "application/octet-stream",
       last_modified: file.lastModified || Date.now(),
       saved_at: new Date().toISOString(),
     });
@@ -628,7 +645,7 @@ async function getAnonymousPdfFile(analysisId, fallbackFilename = "paper.pdf") {
         return;
       }
       resolve(new File([record.file], record.filename || fallbackFilename, {
-        type: record.type || "application/pdf",
+        type: record.type || "application/octet-stream",
         lastModified: record.last_modified || Date.now(),
       }));
     };
@@ -1857,7 +1874,7 @@ function renderProject(project, activeAnalysisId = "") {
         if (!storedFile) {
           const placeholder = resultPanel.querySelector('[data-field="pdfPlaceholder"]');
           if (placeholder) {
-            placeholder.textContent = "Original PDF was not found in this browser. Re-upload the PDF or sign in to save future papers across sessions.";
+            placeholder.textContent = "Original document was not found in this browser. Re-upload the file or sign in to save future papers across sessions.";
           }
           return;
         }
@@ -2075,13 +2092,20 @@ function renderResult(result, fallbackFilename = "Analysis Result", options = {}
   }
   renderVideoScriptDownload(downloadScriptLink, downloadSlidesLink, downloadSlidesHtmlLink, analysisId, result.video_script);
   renderVideoResult(videoStatus, downloadVideoLink, result.video);
+  const sourceExt = (result.source_file_extension || "").toLowerCase() || fileExtension(fallbackFilename);
   renderPdfViewer(resultPanel, analysisId, {
     preferLocalPdf: Boolean(options.localPdfFile && activeLocalPdfUrl),
     fallbackPdfUrl: source.pdf_url || "",
     localPdfMissing: Boolean(options.localPdfMissing),
+    sourceFileExtension: sourceExt,
   });
   updateVideoArtifactAvailability(resultPanel);
   bindTabs(resultPanel);
+}
+
+function isSourcePdf(options) {
+  const ext = (options.sourceFileExtension || ".pdf").toLowerCase();
+  return ext === ".pdf";
 }
 
 function renderPdfViewer(root, analysisId, options = {}) {
@@ -2090,6 +2114,23 @@ function renderPdfViewer(root, analysisId, options = {}) {
   const placeholder = root.querySelector('[data-field="pdfPlaceholder"]');
   const downloadPdf = root.querySelector('[data-field="downloadPdf"]');
   if (!panel || !viewer || !placeholder) return;
+
+  if (!isSourcePdf(options)) {
+    panel.dataset.pdfBaseUrl = "";
+    panel.dataset.sourceIsPdf = "false";
+    viewer.hidden = true;
+    viewer.removeAttribute("src");
+    placeholder.hidden = false;
+    placeholder.textContent = "Document preview is available for PDF files only. Use the Download button to view the original.";
+    if (downloadPdf && analysisId) {
+      downloadPdf.href = withAccessToken(`/analyses/${encodeURIComponent(analysisId)}/pdf`);
+      downloadPdf.hidden = false;
+      downloadPdf.download = "";
+    }
+    return;
+  }
+
+  panel.dataset.sourceIsPdf = "true";
 
   if (options.preferLocalPdf && activeLocalPdfUrl) {
     panel.dataset.pdfBaseUrl = activeLocalPdfUrl;
@@ -2135,7 +2176,7 @@ function renderPdfViewer(root, analysisId, options = {}) {
     viewer.hidden = true;
     viewer.removeAttribute("src");
     placeholder.hidden = false;
-    placeholder.textContent = "Original PDF is available only during the upload session.";
+    placeholder.textContent = "Original document is available only during the upload session.";
     if (downloadPdf) {
       downloadPdf.hidden = true;
       downloadPdf.removeAttribute("href");
@@ -2148,7 +2189,7 @@ function renderPdfViewer(root, analysisId, options = {}) {
   viewer.hidden = true;
   viewer.removeAttribute("src");
   placeholder.hidden = false;
-  placeholder.textContent = "Checking original PDF...";
+  placeholder.textContent = "Checking original document...";
   if (downloadPdf) {
     downloadPdf.hidden = true;
     downloadPdf.removeAttribute("href");
@@ -2159,7 +2200,7 @@ function renderPdfViewer(root, analysisId, options = {}) {
 async function checkPdfAvailability(viewer, placeholder, pdfUrl, downloadPdf) {
   try {
     const response = await apiFetch(pdfUrl, {method: "HEAD"});
-    if (!response.ok) throw new Error("PDF unavailable");
+    if (!response.ok) throw new Error("Document unavailable");
     viewer.hidden = false;
     viewer.src = pdfViewerUrl(pdfUrl, 1);
     placeholder.hidden = true;
@@ -2172,7 +2213,7 @@ async function checkPdfAvailability(viewer, placeholder, pdfUrl, downloadPdf) {
     viewer.hidden = true;
     viewer.removeAttribute("src");
     placeholder.hidden = false;
-    placeholder.textContent = "Original PDF is not available for this analysis.";
+    placeholder.textContent = "Original document is not available for this analysis.";
     if (downloadPdf) {
       downloadPdf.hidden = true;
       downloadPdf.removeAttribute("href");
@@ -2196,6 +2237,16 @@ function navigateToEvidencePage(page, activeEvidenceItem = null) {
   if (!page) {
     return;
   }
+
+  if (panel?.dataset.sourceIsPdf === "false") {
+    if (placeholder) {
+      placeholder.hidden = false;
+      placeholder.textContent = "Page navigation is available for PDF files only.";
+    }
+    markActiveEvidence(activeEvidenceItem);
+    return;
+  }
+
   if (!pdfUrl || !viewer) {
     if (placeholder) {
       placeholder.hidden = false;
@@ -2204,7 +2255,6 @@ function navigateToEvidencePage(page, activeEvidenceItem = null) {
     return;
   }
 
-  // TODO(v2): map evidence snippets to text ranges or bounding boxes for true PDF highlighting.
   viewer.hidden = false;
   viewer.removeAttribute("src");
   requestAnimationFrame(() => {
