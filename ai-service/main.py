@@ -19,6 +19,7 @@ from llm.summarizer import (
     is_gemini_configured,
     normalize_summary_mode,
 )
+from parser.document_parser import SUPPORTED_EXTENSIONS as SUPPORTED_DOC_EXTENSIONS
 from parser.pdf_parser import parse_pdf_pages
 from parser.reference_extractor import extract_references
 from pipeline import run_pipeline
@@ -74,6 +75,13 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 STATIC_DIR = BASE_DIR / "static"
 DOWNLOAD_TIMEZONE = ZoneInfo("America/Los_Angeles")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+EXTENSION_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -97,7 +105,7 @@ class RenameProjectRequest(BaseModel):
     name: str
 
 
-def analyze_pdf_file(
+def analyze_document_file(
     file_path: str | Path,
     filename: str,
     summary_mode: str = "standard",
@@ -122,6 +130,7 @@ def analyze_pdf_file(
     result["generated_at"] = generated_at.isoformat()
     result["summary_mode"] = normalized_summary_mode
     result["processing_seconds"] = round(time.perf_counter() - started_at, 2)
+    result["source_file_extension"] = Path(filename).suffix.lower()
     if project_id:
         result["project_id"] = project_id
     if source_metadata:
@@ -136,6 +145,9 @@ def analyze_pdf_file(
         return result
     record = save_analysis(filename, result, source_pdf_path=Path(file_path), user_id=user_id, project_id=project_id)
     return record["result"]
+
+
+analyze_pdf_file = analyze_document_file
 
 
 def _ensure_gemini_configured() -> None:
@@ -242,11 +254,14 @@ def _safe_filename_part(value: object) -> str:
     return text or "analysis"
 
 
-def _safe_pdf_storage_name(filename: str) -> str:
+def _safe_document_storage_name(filename: str) -> str:
     original = Path(filename or "uploaded.pdf")
     stem = _safe_filename_part(original.stem or "paper")
-    suffix = original.suffix.lower() if original.suffix.lower() == ".pdf" else ".pdf"
+    suffix = original.suffix.lower() if original.suffix.lower() in SUPPORTED_DOC_EXTENSIONS else ".pdf"
     return f"{stem}-{uuid4().hex[:12]}{suffix}"
+
+
+_safe_pdf_storage_name = _safe_document_storage_name
 
 
 def _project_name_from_filename(filename: str) -> str:
@@ -852,6 +867,7 @@ async def auth_config():
     return supabase_public_config()
 
 
+@app.post("/analyze-document")
 @app.post("/analyze-pdf")
 async def analyze_pdf(
     request: Request,
@@ -864,10 +880,10 @@ async def analyze_pdf(
     should_persist = _should_persist_analysis(user_id)
 
     filename = Path(file.filename or "uploaded.pdf").name
-    if Path(filename).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Upload a PDF file.")
+    if Path(filename).suffix.lower() not in SUPPORTED_DOC_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Upload a PDF, DOCX, MD, or TXT file.")
 
-    stored_filename = _safe_pdf_storage_name(filename)
+    stored_filename = _safe_document_storage_name(filename)
     file_path = UPLOAD_DIR / stored_filename
     project = None
     project_id = None
@@ -879,7 +895,7 @@ async def analyze_pdf(
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        result = analyze_pdf_file(
+        result = analyze_document_file(
             file_path,
             filename,
             summary_mode=summary_mode,
@@ -972,11 +988,11 @@ async def _analyze_project_files(
     user_id: str,
     project_id: str | None = None,
 ) -> dict:
-    pdf_files = [item for item in files if Path(item.filename or "").suffix.lower() == ".pdf"]
+    pdf_files = [item for item in files if Path(item.filename or "").suffix.lower() in SUPPORTED_DOC_EXTENSIONS]
     if not pdf_files:
-        raise HTTPException(status_code=400, detail="Upload at least one PDF file.")
+        raise HTTPException(status_code=400, detail="Upload at least one supported file (PDF, DOCX, MD, or TXT).")
     if len(pdf_files) > 10:
-        raise HTTPException(status_code=400, detail="Upload up to 10 PDF files.")
+        raise HTTPException(status_code=400, detail="Upload up to 10 files.")
 
     if project_id:
         project = get_project(project_id, user_id=user_id)
@@ -990,12 +1006,12 @@ async def _analyze_project_files(
     failures: list[dict] = []
     for index, upload in enumerate(pdf_files, start=1):
         filename = Path(upload.filename or "uploaded.pdf").name
-        stored_filename = _safe_pdf_storage_name(filename)
+        stored_filename = _safe_document_storage_name(filename)
         file_path = UPLOAD_DIR / stored_filename
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(upload.file, buffer)
         try:
-            result = analyze_pdf_file(
+            result = analyze_document_file(
                 file_path,
                 filename,
                 summary_mode=summary_mode,
@@ -1097,7 +1113,7 @@ async def analyze_arxiv_paper(
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
 
     try:
-        result = analyze_pdf_file(
+        result = analyze_document_file(
             pdf_path,
             f"arxiv-{request.arxiv_id}.pdf",
             summary_mode=request.summary_mode,
@@ -1148,7 +1164,7 @@ async def reanalyze_existing_pdf(
 
     pdf_path = _record_pdf_path(record)
     if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="Original PDF not found. Upload or analyze the paper again.")
+        raise HTTPException(status_code=404, detail="Original document not found. Upload or analyze the paper again.")
 
     result = record.get("result", {})
     previous_summary_mode = result.get("summary_mode") or "standard"
@@ -1158,7 +1174,7 @@ async def reanalyze_existing_pdf(
         if requested_summary_mode in {"", "same"}
         else normalize_summary_mode(requested_summary_mode)
     )
-    return analyze_pdf_file(
+    return analyze_document_file(
         pdf_path,
         Path(record.get("filename") or pdf_path.name).name,
         summary_mode=selected_summary_mode,
@@ -1365,41 +1381,46 @@ async def get_analysis_pdf(
     if not record:
         raise HTTPException(status_code=404, detail="Analysis not found")
 
+    source_ext = Path(record.get("filename") or "file.pdf").suffix.lower()
+    content_type = EXTENSION_CONTENT_TYPES.get(source_ext, "application/octet-stream")
+
     r2_object_key = str(record.get("source_pdf_object_key") or "").strip()
     if r2_object_key:
         if request.method == "HEAD":
             metadata = head_r2_object(r2_object_key)
             if not metadata:
-                raise HTTPException(status_code=404, detail="Original PDF not found")
+                raise HTTPException(status_code=404, detail="Original source document not found")
             headers = {}
             if metadata.get("ContentLength") is not None:
                 headers["Content-Length"] = str(metadata.get("ContentLength"))
-            return Response(headers=headers, media_type="application/pdf")
+            return Response(headers=headers, media_type=content_type)
 
         r2_object = get_r2_object(r2_object_key)
         if not r2_object:
-            raise HTTPException(status_code=404, detail="Original PDF not found")
+            raise HTTPException(status_code=404, detail="Original source document not found")
         body = r2_object.get("Body")
         if not body:
-            raise HTTPException(status_code=404, detail="Original PDF not found")
+            raise HTTPException(status_code=404, detail="Original source document not found")
+        file_ext = source_ext.lstrip(".")
         headers = {
             "Content-Disposition": (
-                f'inline; filename="{_artifact_filename(record, analysis_id, "source-pdf", "pdf")}"'
+                f'inline; filename="{_artifact_filename(record, analysis_id, "source-pdf", file_ext)}"'
             )
         }
         content_length = r2_object.get("ContentLength")
         if content_length is not None:
             headers["Content-Length"] = str(content_length)
-        return StreamingResponse(body.iter_chunks(chunk_size=1024 * 1024), media_type="application/pdf", headers=headers)
+        return StreamingResponse(body.iter_chunks(chunk_size=1024 * 1024), media_type=content_type, headers=headers)
 
     pdf_path = _record_pdf_path(record)
-    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
-        raise HTTPException(status_code=404, detail="Original PDF not found")
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Original source document not found")
 
+    file_ext = pdf_path.suffix.lower().lstrip(".")
     return FileResponse(
         pdf_path,
-        media_type="application/pdf",
-        filename=_artifact_filename(record, analysis_id, "source-pdf", "pdf"),
+        media_type=EXTENSION_CONTENT_TYPES.get(pdf_path.suffix.lower(), "application/octet-stream"),
+        filename=_artifact_filename(record, analysis_id, "source-pdf", file_ext),
         content_disposition_type="inline",
     )
 

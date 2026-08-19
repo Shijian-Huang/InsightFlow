@@ -66,26 +66,43 @@ def _r2_analysis_prefix(user_id: str, analysis_id: str, project_id: str | None =
     return f"users/{user_id}/analyses/{analysis_id}"
 
 
-def _r2_pdf_key(user_id: str, analysis_id: str, project_id: str | None = None) -> str:
-    return f"{_r2_analysis_prefix(user_id, analysis_id, project_id=project_id)}/original.pdf"
+EXTENSION_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 
 
-def upload_source_pdf_to_r2(path: str | Path, user_id: str, analysis_id: str, project_id: str | None = None) -> str:
+def _r2_source_key(user_id: str, analysis_id: str, ext: str = ".pdf", project_id: str | None = None) -> str:
+    return f"{_r2_analysis_prefix(user_id, analysis_id, project_id=project_id)}/original{ext}"
+
+
+_r2_pdf_key = lambda user_id, analysis_id, project_id=None: _r2_source_key(user_id, analysis_id, ".pdf", project_id=project_id)
+
+
+def upload_source_document_to_r2(path: str | Path, user_id: str, analysis_id: str, project_id: str | None = None) -> str:
     if not is_r2_storage_enabled():
         return ""
 
-    pdf_path = Path(path)
-    if not pdf_path.exists() or not pdf_path.is_file():
+    source_path = Path(path)
+    if not source_path.exists() or not source_path.is_file():
         return ""
 
-    object_key = _r2_pdf_key(user_id, analysis_id, project_id=project_id)
+    ext = source_path.suffix.lower() or ".pdf"
+    content_type = EXTENSION_CONTENT_TYPES.get(ext, "application/octet-stream")
+    object_key = _r2_source_key(user_id, analysis_id, ext, project_id=project_id)
     _r2_client().upload_file(
-        str(pdf_path),
+        str(source_path),
         R2_BUCKET,
         object_key,
-        ExtraArgs={"ContentType": "application/pdf"},
+        ExtraArgs={"ContentType": content_type},
     )
     return object_key
+
+
+upload_source_pdf_to_r2 = upload_source_document_to_r2
 
 
 def get_r2_object(object_key: str) -> dict[str, Any] | None:
@@ -491,7 +508,7 @@ def save_analysis(
     if source_pdf_path:
         record["source_pdf_path"] = str(source_pdf_path)
         if user_id:
-            object_key = upload_source_pdf_to_r2(source_pdf_path, user_id, analysis_id, project_id=project_id)
+            object_key = upload_source_document_to_r2(source_pdf_path, user_id, analysis_id, project_id=project_id)
             if object_key:
                 record["source_pdf_object_key"] = object_key
 
