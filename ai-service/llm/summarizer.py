@@ -16,11 +16,17 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-# The client gets the API key from the environment variable `GEMINI_API_KEY`.
+# Gemini is optional when DeepDoc runs through local Ollama. Do not construct
+# its client unless a key is configured; recent SDK versions reject an empty
+# key during module import.
 api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(
-    api_key=api_key,
-    http_options=types.HttpOptions(timeout=30000)
+client = (
+    genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=30000),
+    )
+    if api_key
+    else None
 )
 
 gemini_models = ["gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"]
@@ -377,6 +383,8 @@ def generate_json(prompt: str, schema: Optional[dict] = None):
                 last_raw_text = str(error)
                 continue
         else:
+            if client is None:
+                raise RuntimeError(gemini_configuration_error())
             try:
                 response = client.models.generate_content(model=model, contents=prompt)
             except (errors.ClientError, errors.ServerError) as error:
