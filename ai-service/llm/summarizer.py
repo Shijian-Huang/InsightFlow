@@ -28,7 +28,7 @@ llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 ollama_models = [
     model.strip()
-    for model in os.getenv("OLLAMA_MODELS", os.getenv("OLLAMA_MODEL", "qwen3:8b")).split(",")
+    for model in os.getenv("DEEPDOC_OLLAMA_MODELS", os.getenv("OLLAMA_MODEL", "qwen3:8b")).split(",")
     if model.strip()
 ]
 ollama_context_length = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "12288"))

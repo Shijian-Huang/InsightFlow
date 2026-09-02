@@ -9,7 +9,7 @@ DeepDoc defaults to a local Qwen model served by Ollama:
 ```bash
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:8b
-OLLAMA_MODELS=qwen3:8b,qwen3:4b
+DEEPDOC_OLLAMA_MODELS=qwen3:8b,qwen3:4b
 OLLAMA_CONTEXT_LENGTH=12288
 OLLAMA_NUM_PREDICT=3072
 OLLAMA_THINK=false
@@ -19,6 +19,9 @@ OLLAMA_CPU_ONLY=false
 
 `OLLAMA_CPU_ONLY=false` allows Ollama to use an available GPU (including Metal
 on macOS). Set it to `true` only for a controlled CPU-only benchmark.
+
+`OLLAMA_MODELS` is reserved by Ollama for its model storage directory. On WAVE,
+set it to a project path such as `/WAVE/projects2/DeepDoc/ollama-models`.
 
 To use Gemini instead, set `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`.
 

@@ -45,7 +45,7 @@ The default provider is the local Qwen model through Ollama:
 ```bash
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:8b
-OLLAMA_MODELS=qwen3:8b,qwen3:4b
+DEEPDOC_OLLAMA_MODELS=qwen3:8b,qwen3:4b
 OLLAMA_CONTEXT_LENGTH=12288
 OLLAMA_NUM_PREDICT=3072
 OLLAMA_THINK=false
@@ -64,7 +64,8 @@ GEMINI_API_KEY=your_gemini_api_key
 
 Start Ollama before DeepDoc with `ollama serve`. On a lab server, point
 `OLLAMA_BASE_URL` to the Ollama service's private network address. A
-comma-separated `OLLAMA_MODELS` value can define fallback models.
+comma-separated `DEEPDOC_OLLAMA_MODELS` value can define selectable models.
+`OLLAMA_MODELS` remains reserved for Ollama's model storage directory.
 
 ```bash
 cd ai-service
