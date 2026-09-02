@@ -244,6 +244,27 @@ class LlmProviderTests(unittest.TestCase):
         self.assertIn("document retrieval method", result["summary"])
         self.assertTrue(result["faithfulness"]["deterministic_fallback"])
 
+    def test_fact_extraction_retries_with_compact_prompt(self):
+        sources = [{
+            "source_id": "abstract_p1_01",
+            "section": "abstract",
+            "pages": [1],
+            "excerpt": "The study evaluates a retrieval method on three datasets.",
+        }]
+        valid = {"facts": [{
+            "category": "method",
+            "fact": "The study evaluates a retrieval method on three datasets.",
+            "source_ids": ["abstract_p1_01"],
+            "source_quote": "The study evaluates a retrieval method on three datasets.",
+        }]}
+        invalid = json.JSONDecodeError("incomplete", "{", 1)
+        with patch.object(summarizer, "generate_json", side_effect=[invalid, valid]) as generate:
+            facts = summarizer.extract_verified_facts("source packet", sources)
+
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("compact retry", generate.call_args.args[0])
+
     def test_unknown_provider_is_rejected(self):
         with patch.object(summarizer, "llm_provider", "unknown"):
             self.assertFalse(summarizer.is_llm_configured())

@@ -742,19 +742,28 @@ FACT_EXTRACTION_SCHEMA = {
     "properties": {
         "facts": {
             "type": "array",
+            "minItems": 8,
+            "maxItems": 16,
             "items": {
                 "type": "object",
                 "properties": {
                     "category": {"type": "string"},
-                    "fact": {"type": "string"},
-                    "source_ids": {"type": "array", "items": {"type": "string"}},
-                    "source_quote": {"type": "string"},
+                    "fact": {"type": "string", "maxLength": 280},
+                    "source_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 3,
+                    },
+                    "source_quote": {"type": "string", "maxLength": 320},
                 },
                 "required": ["category", "fact", "source_ids", "source_quote"],
+                "additionalProperties": False,
             },
         },
     },
     "required": ["facts"],
+    "additionalProperties": False,
 }
 
 
@@ -812,7 +821,12 @@ ANALYSIS_SCHEMA = {
 }
 
 
-def build_fact_extraction_prompt(evidence_packet: str) -> str:
+def build_fact_extraction_prompt(evidence_packet: str, compact: bool = False) -> str:
+    retry_instruction = (
+        "This is a compact retry. Return 8-12 facts only and keep every fact and quote brief."
+        if compact else
+        "Return 12-16 facts only."
+    )
     return f"""
     Extract atomic, verifiable facts from the research-paper sources below.
     This is evidence extraction, not summarization. Use only the supplied source text.
@@ -824,11 +838,13 @@ def build_fact_extraction_prompt(evidence_packet: str) -> str:
     - Keep distinct stages distinct: assessed, responded, passed filtering/reliability, and included in final analysis.
     - Do not infer causality, novelty, significance, intent, implications, or internal mental states.
     - If the paper does not state something, omit it. Never fill a gap from general knowledge.
-    - Extract 12-24 high-value facts when the sources support them.
+    - {retry_instruction}
     - MUST extract separate facts for every reported model/sample count and every filtering stage.
-    - MUST extract the main aggregate results and strongest baseline/model comparisons from tables.
+    - Extract the main aggregate results and at most two decision-relevant model comparisons from tables.
     - Prefer methods, results, tables, and limitations over generic background.
-    - Do not spend facts on metric formulas or textbook definitions unless the formula is the paper's contribution.
+    - Never extract metric formulas or textbook definitions unless the formula is the paper's central contribution.
+    - Do not enumerate every model or every row of a results table.
+    - Keep fact under 280 characters and source_quote under 320 characters.
     - Inspect every supplied source block before finishing.
     - Use one independently checkable assertion per fact.
 
@@ -1094,7 +1110,14 @@ def supplement_short_summary(result: dict, verified_facts: list[dict], summary_m
 
 
 def extract_verified_facts(evidence_packet: str, evidence_sources: list[dict]) -> list[dict]:
-    raw_facts = generate_json(build_fact_extraction_prompt(evidence_packet), schema=FACT_EXTRACTION_SCHEMA)
+    try:
+        raw_facts = generate_json(build_fact_extraction_prompt(evidence_packet), schema=FACT_EXTRACTION_SCHEMA)
+    except json.JSONDecodeError:
+        check_analysis_cancelled()
+        raw_facts = generate_json(
+            build_fact_extraction_prompt(evidence_packet, compact=True),
+            schema=FACT_EXTRACTION_SCHEMA,
+        )
     return normalize_verified_facts(raw_facts, evidence_sources)
 
 
@@ -1272,7 +1295,11 @@ def summarize_research_paper(
             "contributions": [],
             "evidence": [],
             "faithfulness": {"verified_fact_count": 0, "grounded_evidence_count": 0},
-            "error": error.doc if isinstance(error, json.JSONDecodeError) else str(error),
+            "error": (
+                "The local model returned incomplete structured output after a compact retry. Please retry the analysis."
+                if isinstance(error, json.JSONDecodeError)
+                else str(error)
+            ),
         }
 
 
