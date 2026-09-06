@@ -18,11 +18,12 @@ REFERENCE_START_RE = re.compile(
 )
 
 TRAILING_SECTION_RE = re.compile(
-    r"(?im)^\s*(appendix|appendices|acknowledg(e)?ments?|code\s+availability|data\s+availability|supplementary\s+materials?)\s*$"
+    r"(?im)^\s*(appendix|appendices|acknowledg(e)?ments?|code\s+availability|data\s+availability|supplementary\s+materials?|supporting\s+information)\b"
 )
 
 APPENDIX_HEADING_RE = re.compile(r"^(appendix|appendices)\b", re.IGNORECASE)
 APPENDIX_LETTER_HEADING_RE = re.compile(r"^[A-Z]\.\s+[^,]{4,80}$")
+APPENDIX_LETTER_NO_DOT_RE = re.compile(r"^[A-H]\s+[A-Z][a-z]{3,}")
 APPENDIX_TITLE_RE = re.compile(r"^[A-Z].{4,}$")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}[a-z]?\b")
 PAGE_NUMBER_RE = re.compile(r"^\d{1,3}$")
@@ -110,16 +111,27 @@ def _extract_reference_section(text: str, relaxed: bool = False) -> str:
             if candidate.strip():
                 next_line = candidate.strip()
                 break
-        if (
-            not relaxed
-            and lines
-            and APPENDIX_LETTER_HEADING_RE.match(line)
-            and not REFERENCE_CONTINUATION_RE.match(next_line)
-            and not YEAR_RE.search(next_line[:80])
-        ):
-            break
-        if not relaxed and lines and APPENDIX_MARKER_RE.match(line) and APPENDIX_TITLE_RE.match(next_line):
-            break
+        if not relaxed and lines:
+            if (
+                APPENDIX_LETTER_HEADING_RE.match(line)
+                and not REFERENCE_CONTINUATION_RE.match(next_line)
+                and not YEAR_RE.search(next_line[:80])
+            ):
+                break
+
+            if (
+                APPENDIX_LETTER_NO_DOT_RE.match(line)
+                and not YEAR_RE.search(line)
+                and not REFERENCE_CONTINUATION_RE.match(next_line)
+                and not YEAR_RE.search(next_line[:80])
+            ):
+                break
+
+            if (
+                APPENDIX_MARKER_RE.match(line)
+                and APPENDIX_TITLE_RE.match(next_line)
+            ):
+                break
         lines.append(raw_line)
 
     ref_text = "\n".join(lines)
@@ -135,6 +147,58 @@ def _clean_reference_entry(entry: str) -> str:
     entry = re.sub(r"(?<=\(\d{4}\)\.)\s+[A-Z][^.]{20,}\s+\d{1,3}$", "", entry)
     entry = re.sub(r"(?<=\.)\s+\d{1,3}$", "", entry)
     return entry
+
+
+APPENDIX_IN_ENTRY_RE = re.compile(
+    r"(?:Appendix|APPENDIX|Appendices|APPENDICES)\s+[A-Z](?:\b|\.)"
+)
+
+YEAR_SENTENCE_END_RE = re.compile(r"\b(?:19|20)\d{2}[a-z]?\b[^.]{0,120}\.")
+
+
+def _is_post_reference_content(text: str) -> bool:
+    if YEAR_RE.search(text[:40]):
+        return False
+    if LEADING_AUTHOR_SURNAME_RE.match(text):
+        return False
+    if REFERENCE_CONTINUATION_RE.match(text):
+        return False
+    if re.match(r"(?i)https?://", text):
+        return False
+    if BRACKET_REFERENCE_RE.match(text):
+        return False
+    if NUMBERED_REFERENCE_RE.match(text):
+        return False
+    return True
+
+
+def _trim_appendix_from_last(entries: list[str]) -> list[str]:
+    if not entries:
+        return entries
+    last = entries[-1]
+    min_ref_len = 80
+    if len(last) <= min_ref_len:
+        return entries
+    match = APPENDIX_IN_ENTRY_RE.search(last, pos=min_ref_len)
+    if match:
+        trimmed = last[:match.start()].rstrip()
+        if len(trimmed) > 40 and YEAR_RE.search(trimmed):
+            return entries[:-1] + [trimmed]
+    if len(entries) < 3:
+        return entries
+    max_other = max(len(e) for e in entries[:-1])
+    if len(last) <= max_other * 2:
+        return entries
+    for m in YEAR_SENTENCE_END_RE.finditer(last):
+        end_pos = m.end()
+        after = last[end_pos:].lstrip()
+        if not after:
+            break
+        if _is_post_reference_content(after):
+            trimmed = last[:end_pos].rstrip()
+            if len(trimmed) > 40:
+                return entries[:-1] + [trimmed]
+    return entries
 
 
 def _repair_reference_boundaries(entries: list[str]) -> list[str]:
@@ -174,7 +238,7 @@ def _extract_bracketed_references(ref_text: str, limit: Optional[int] = None) ->
         if len(entry) > 40 and re.search(r"(19|20)\d{2}", entry):
             entries.append(entry)
 
-    return _repair_reference_boundaries(entries)
+    return _trim_appendix_from_last(_repair_reference_boundaries(entries))
 
 
 def _extract_inline_bracketed_references(ref_text: str, limit: Optional[int] = None) -> list[str]:
@@ -190,7 +254,7 @@ def _extract_inline_bracketed_references(ref_text: str, limit: Optional[int] = N
         if len(entry) > 40 and YEAR_RE.search(entry):
             entries.append(entry)
 
-    return _repair_reference_boundaries(entries)
+    return _trim_appendix_from_last(_repair_reference_boundaries(entries))
 
 
 def _extract_numbered_references(ref_text: str, limit: Optional[int] = None) -> list[str]:
@@ -207,7 +271,7 @@ def _extract_numbered_references(ref_text: str, limit: Optional[int] = None) -> 
         if len(entry) > 40:
             entries.append(entry)
 
-    return _repair_reference_boundaries(entries)
+    return _trim_appendix_from_last(_repair_reference_boundaries(entries))
 
 
 def _looks_like_reference_start(line: str) -> bool:
@@ -242,11 +306,11 @@ def _extract_unnumbered_references(ref_text: str, limit: Optional[int] = None) -
         entries.append(_clean_reference_entry(" ".join(current)))
 
     selected_entries = entries[:limit] if limit is not None else entries
-    return _repair_reference_boundaries([
+    return _trim_appendix_from_last(_repair_reference_boundaries([
         entry
         for entry in selected_entries
         if len(entry) > 40 and YEAR_RE.search(entry)
-    ])
+    ]))
 
 
 def extract_references_local(ref_text: str, limit: Optional[int] = None) -> list[str]:
@@ -296,11 +360,11 @@ def extract_references_local(ref_text: str, limit: Optional[int] = None) -> list
         entries.append(_clean_reference_entry(" ".join(current)))
 
     selected_entries = entries[:limit] if limit is not None else entries
-    return _repair_reference_boundaries([
+    return _trim_appendix_from_last(_repair_reference_boundaries([
         entry
         for entry in selected_entries
         if len(entry) > 40 and re.search(r"(19|20)\d{2}", entry)
-    ])
+    ]))
 
 
 def _expected_marker_count(ref_text: str) -> int:
