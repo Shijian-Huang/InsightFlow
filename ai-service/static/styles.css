@@ -2710,6 +2710,61 @@ li {
   text-decoration: none;
 }
 
+.eval-scores {
+  display: grid;
+  gap: 10px;
+}
+
+.eval-score-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.eval-score-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 760;
+}
+
+.eval-score-value {
+  font-size: 0.86rem;
+  font-weight: 820;
+  font-variant-numeric: tabular-nums;
+}
+
+.eval-good { color: #1a8917; }
+.eval-moderate { color: #b58a00; }
+.eval-poor { color: #cf222e; }
+
+.eval-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.eval-loading::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(0, 0, 0, 0.1);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: eval-spin 0.8s linear infinite;
+}
+
+@keyframes eval-spin {
+  to { transform: rotate(360deg); }
+}
+
+.eval-error {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
 .reference-entry {
   position: relative;
   display: grid;

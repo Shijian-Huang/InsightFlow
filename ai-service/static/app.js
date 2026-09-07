@@ -3113,6 +3113,7 @@ function formatOverviewMeta(result, text) {
 }
 
 function renderPaperInfo(container, result, fallbackFilename) {
+  console.log("renderPaperInfo result:", result);
   if (!container) return;
   container.innerHTML = "";
   const source = result.source_metadata || {};
@@ -3168,6 +3169,84 @@ function renderPaperInfo(container, result, fallbackFilename) {
     group.appendChild(links);
     container.appendChild(group);
   }
+
+  const analysisId = result.analysis_id;
+  console.log("renderPaperInfo analysisId:", analysisId);
+  if (analysisId) {
+    const evalGroup = document.createElement("div");
+    evalGroup.className = "paper-info-group";
+    evalGroup.innerHTML = '<h4>Summary Evaluation</h4><div class="eval-loading">Evaluating summary</div>';
+    evalGroup.dataset.evalTarget = analysisId;
+    container.appendChild(evalGroup);
+    pollEvaluation(analysisId, evalGroup);
+  }
+}
+
+function evalScoreClass(value, invert) {
+  if (invert) {
+    if (value <= 0.1) return "eval-good";
+    if (value <= 0.2) return "eval-moderate";
+    return "eval-poor";
+  }
+  if (value >= 0.8) return "eval-good";
+  if (value >= 0.6) return "eval-moderate";
+  return "eval-poor";
+}
+
+function renderEvaluationScores(container, data) {
+  const scores = data.scores || {};
+  const coverage = scores.key_ideas_coverage;
+  const contrib = scores.contributions_coverage;
+  const halluc = scores.hallucination_rate;
+
+  const rows = [
+    ["Key Ideas Coverage", coverage, false],
+    ["Contributions Coverage", contrib, false],
+    ["Hallucination Rate", halluc, true],
+  ];
+
+  let html = '<h4>Evaluation</h4><div class="eval-scores">';
+  rows.forEach(([label, value, invert]) => {
+    if (value === undefined || value === null) return;
+    const pct = Math.round(value * 100);
+    const cls = evalScoreClass(value, invert);
+    html += `<div class="eval-score-row"><span class="eval-score-label">${escapeHtml(label)}</span><span class="eval-score-value ${cls}">${pct}%</span></div>`;
+  });
+  html += "</div>";
+  container.innerHTML = html;
+}
+
+function pollEvaluation(analysisId, container) {
+  let attempts = 0;
+  const maxAttempts = 30;
+  const intervalMs = 3000;
+
+  const timer = setInterval(async () => {
+    attempts++;
+    if (attempts > maxAttempts) {
+      clearInterval(timer);
+      container.innerHTML = '<h4>Evaluation</h4><span class="eval-error">Evaluation timed out.</span>';
+      return;
+    }
+    try {
+      const res = await apiFetch(withAccessToken(`/analyses/${encodeURIComponent(analysisId)}/evaluation`));
+      if (res.status === 202) return;
+      clearInterval(timer);
+      if (!res.ok) {
+        container.innerHTML = '<h4>Evaluation</h4><span class="eval-error">Evaluation unavailable.</span>';
+        return;
+      }
+      const data = await res.json();
+      if (data.error) {
+        container.innerHTML = '<h4>Evaluation</h4><span class="eval-error">Evaluation failed.</span>';
+        return;
+      }
+      renderEvaluationScores(container, data);
+    } catch {
+      clearInterval(timer);
+      container.innerHTML = '<h4>Evaluation</h4><span class="eval-error">Evaluation unavailable.</span>';
+    }
+  }, intervalMs);
 }
 
 function appendPaperInfoRow(container, label, value) {

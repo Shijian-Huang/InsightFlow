@@ -1,6 +1,3 @@
-import threading
-
-from llm.evaluator import run_evaluation
 from llm.summarizer import normalize_summary_mode, summarize_research_paper
 from parser.document_parser import extract_document_title, parse_document_pages
 from parser.reference_extractor import extract_references_with_diagnostics
@@ -58,25 +55,17 @@ def run_pipeline(file_path: str, summary_mode: str = "standard"):
         summary_mode=normalized_mode,
     )
     final_summary.setdefault("title", paper_title)
-
-    if "error" not in final_summary:
-        threading.Thread(
-            target=run_evaluation,
-            args=(final_summary, summary_input, normalized_mode),
-            daemon=True,
-        ).start()
-
     reference_fields = _reference_result_fields(raw_text)
 
     return {
         "paper_title": paper_title,
         "summary_mode": normalized_mode,
         "document_summary": final_summary,
-        # "chunk_summaries": [],
         **reference_fields,
         "summary_input_sections": selected_sections,
         "evidence_sources": evidence_sources,
-        "page_count": len(pages)
+        "page_count": len(pages),
+        "_summary_input": summary_input,
     }
 
 

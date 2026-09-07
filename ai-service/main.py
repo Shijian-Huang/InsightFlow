@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+import threading
+
+from llm.evaluator import get_evaluation, run_evaluation
 from llm.summarizer import (
     generate_video_script,
     gemini_configuration_error,
@@ -125,6 +128,8 @@ def analyze_document_file(
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {error}") from error
 
+    summary_input = result.pop("_summary_input", None)
+
     generated_at = datetime.now(timezone.utc)
     result["submitted_at"] = submitted_at.isoformat()
     result["generated_at"] = generated_at.isoformat()
@@ -142,12 +147,27 @@ def analyze_document_file(
             if isinstance(summary, dict):
                 summary["title"] = source_title
     if not persist:
+        _start_evaluation(result, summary_input, normalized_summary_mode)
         return result
     record = save_analysis(filename, result, source_pdf_path=Path(file_path), user_id=user_id, project_id=project_id)
+    _start_evaluation(record["result"], summary_input, normalized_summary_mode)
     return record["result"]
 
 
 analyze_pdf_file = analyze_document_file
+
+
+def _start_evaluation(result: dict, summary_input: str | None, summary_mode: str) -> None:
+    document_summary = result.get("document_summary")
+    if not summary_input or not isinstance(document_summary, dict) or "error" in document_summary:
+        return
+    analysis_id = result.get("analysis_id")
+    threading.Thread(
+        target=run_evaluation,
+        args=(document_summary, summary_input, summary_mode),
+        kwargs={"analysis_id": analysis_id},
+        daemon=True,
+    ).start()
 
 
 def _ensure_gemini_configured() -> None:
@@ -1461,6 +1481,24 @@ async def delete_saved_analysis(
     if not deletion_result:
         raise HTTPException(status_code=404, detail="Analysis not found")
     return deletion_result
+
+
+@app.get("/analyses/{analysis_id}/evaluation")
+async def get_analysis_evaluation(
+    request: Request,
+    analysis_id: str,
+    access_token: str | None = Query(None),
+):
+    user_id = _current_user_id(request, access_token=access_token)
+    record = get_analysis(analysis_id, user_id=user_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    evaluation = get_evaluation(analysis_id)
+    if evaluation is None:
+        return Response(status_code=202)
+
+    return evaluation
 
 
 @app.get("/analyses/{analysis_id}")

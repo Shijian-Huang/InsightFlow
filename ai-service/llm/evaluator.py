@@ -1,9 +1,27 @@
 import json
 import logging
+import threading
 
 from llm.summarizer import generate_json
 
 logger = logging.getLogger(__name__)
+
+_evaluation_results: dict[str, dict] = {}
+_results_lock = threading.Lock()
+MAX_STORED_RESULTS = 100
+
+
+def _store_result(analysis_id: str, result: dict) -> None:
+    with _results_lock:
+        if len(_evaluation_results) >= MAX_STORED_RESULTS:
+            oldest_key = next(iter(_evaluation_results))
+            del _evaluation_results[oldest_key]
+        _evaluation_results[analysis_id] = result
+
+
+def get_evaluation(analysis_id: str) -> dict | None:
+    with _results_lock:
+        return _evaluation_results.get(analysis_id)
 
 
 def build_evaluation_prompt(document_summary: dict, evidence_packet: str) -> str:
@@ -123,17 +141,25 @@ def evaluate_summary(document_summary: dict, evidence_packet: str) -> dict:
         }
 
 
-def run_evaluation(document_summary: dict, evidence_packet: str, summary_mode: str) -> None:
+def run_evaluation(
+    document_summary: dict,
+    evidence_packet: str,
+    summary_mode: str,
+    analysis_id: str | None = None,
+) -> None:
     logger.info("Starting summary evaluation (mode: %s)...", summary_mode)
     result = evaluate_summary(document_summary, evidence_packet)
 
     if "error" in result:
         logger.error("Summary evaluation failed: %s", result["error"])
+        if analysis_id:
+            _store_result(analysis_id, result)
         return
 
     logger.info(
         "Summary evaluation complete.\n%s",
         json.dumps(result, ensure_ascii=False, indent=2),
     )
-    with open(f"summary_evaluation_{summary_mode}.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    if analysis_id:
+        _store_result(analysis_id, result)
